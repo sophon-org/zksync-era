@@ -1,11 +1,8 @@
 use std::{
-    convert::Infallible,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
-use tokio::sync::watch;
 use tracing::{info_span, Instrument};
 use zksync_multivm::{
     interface::{
@@ -14,44 +11,24 @@ use zksync_multivm::{
     },
     utils::StorageWritesDeduplicator,
 };
+use zksync_concurrency::{ctx,time,error::Wrap as _};
 use zksync_shared_metrics::{TxStage, APP_METRICS};
-use zksync_state::{OwnedStorage, ReadStorageFactory};
+use zksync_state::{OwnedStorage};
 use zksync_types::{
     block::L2BlockExecutionData, l2::TransactionType, protocol_upgrade::ProtocolUpgradeTx,
     protocol_version::ProtocolVersionId, utils::display_timestamp, L1BatchNumber, Transaction,
 };
 
 use crate::{
+    state_keeper_storage::ReadStorageFactory,
     executor::TxExecutionResult,
-    io::{IoCursor, L1BatchParams, L2BlockParams, OutputHandler, PendingBatchData, StateKeeperIO},
+    io::{IoCursor, L2BlockParams, OutputHandler, PendingBatchData, StateKeeperIO},
     metrics::{AGGREGATION_METRICS, KEEPER_METRICS, L1_BATCH_METRICS},
     seal_criteria::{ConditionalSealer, SealData, SealResolution, UnexecutableReason},
     types::ExecutionMetricsForCriteria,
     updates::UpdatesManager,
     utils::gas_count_from_writes,
 };
-
-/// Amount of time to block on waiting for some resource. The exact value is not really important,
-/// we only need it to not block on waiting indefinitely and be able to process cancellation requests.
-pub(super) const POLL_WAIT_DURATION: Duration = Duration::from_secs(1);
-
-/// Structure used to indicate that task cancellation was requested.
-#[derive(thiserror::Error, Debug)]
-pub(super) enum Error {
-    #[error("canceled")]
-    Canceled,
-    #[error(transparent)]
-    Fatal(#[from] anyhow::Error),
-}
-
-impl Error {
-    fn context(self, msg: &'static str) -> Self {
-        match self {
-            Self::Canceled => Self::Canceled,
-            Self::Fatal(err) => Self::Fatal(err.context(msg)),
-        }
-    }
-}
 
 /// State keeper represents a logic layer of L1 batch / L2 block processing flow.
 /// It's responsible for taking all the data from the `StateKeeperIO`, feeding it into `BatchExecutor` objects
@@ -64,170 +41,151 @@ impl Error {
 /// a sequence of executed L2 blocks and batches.
 #[derive(Debug)]
 pub struct ZkSyncStateKeeper {
-    stop_receiver: watch::Receiver<bool>,
-    io: Box<dyn StateKeeperIO>,
-    output_handler: OutputHandler,
-    batch_executor: Box<dyn BatchExecutorFactory<OwnedStorage>>,
-    sealer: Arc<dyn ConditionalSealer>,
-    storage_factory: Arc<dyn ReadStorageFactory>,
+    pub io: Box<dyn StateKeeperIO>,
+    pub output_handler: OutputHandler,
+    pub batch_executor: Box<dyn BatchExecutorFactory<OwnedStorage>>,
+    pub sealer: Arc<dyn ConditionalSealer>,
+    pub storage_factory: Arc<dyn ReadStorageFactory>,
 }
 
 impl ZkSyncStateKeeper {
-    pub fn new(
-        stop_receiver: watch::Receiver<bool>,
-        sequencer: Box<dyn StateKeeperIO>,
-        batch_executor: Box<dyn BatchExecutorFactory<OwnedStorage>>,
-        output_handler: OutputHandler,
-        sealer: Arc<dyn ConditionalSealer>,
-        storage_factory: Arc<dyn ReadStorageFactory>,
-    ) -> Self {
-        Self {
-            stop_receiver,
-            io: sequencer,
-            batch_executor,
-            output_handler,
-            sealer,
-            storage_factory,
-        }
-    }
+    /// Fallible version of `run` routine that allows to easily exit upon cancellation.
+    pub async fn run(mut self, ctx :&ctx::Ctx) -> anyhow::Result<()> {
+        let res : ctx::Result<()> = async {
+            let (cursor, pending_batch_params) = self.io.initialize().await?;
+            self.output_handler.initialize(&cursor).await?;
+            tracing::info!(
+                "Starting state keeper. Next l1 batch to seal: {}, next L2 block to seal: {}",
+                cursor.l1_batch,
+                cursor.next_l2_block
+            );
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        match self.run_inner().await {
+            // Re-execute pending batch if it exists. Otherwise, initialize a new batch.
+            let PendingBatchData {
+                mut l1_batch_env,
+                mut system_env,
+                pending_l2_blocks,
+            } = match pending_batch_params {
+                Some(params) => {
+                    tracing::info!(
+                        "There exists a pending batch consisting of {} L2 blocks, the first one is {}",
+                        params.pending_l2_blocks.len(),
+                        params
+                            .pending_l2_blocks
+                            .first()
+                            .context("expected at least one pending L2 block")?
+                            .number
+                    );
+                    params
+                }
+                None => {
+                    tracing::info!("There is no open pending batch, starting a new empty batch");
+                    let (system_env, l1_batch_env) = self
+                        .wait_for_new_batch_env(ctx, &cursor)
+                        .await
+                        .wrap("wait_for_new_batch_env()")?;
+                    PendingBatchData {
+                        l1_batch_env,
+                        pending_l2_blocks: Vec::new(),
+                        system_env,
+                    }
+                }
+            };
+
+            let protocol_version = system_env.version;
+            let mut updates_manager = UpdatesManager::new(&l1_batch_env, &system_env);
+            let mut protocol_upgrade_tx: Option<ProtocolUpgradeTx> = self
+                .load_protocol_upgrade_tx(&pending_l2_blocks, protocol_version, l1_batch_env.number)
+                .await?;
+
+            let mut batch_executor = self
+                .create_batch_executor(ctx, l1_batch_env.clone(), system_env.clone())
+                .await?;
+            self.restore_state(
+                ctx,
+                &mut *batch_executor,
+                &mut updates_manager,
+                pending_l2_blocks,
+            )
+            .await?;
+
+            let mut l1_batch_seal_delta: Option<time::Instant> = None;
+            loop {
+                // This function will run until the batch can be sealed.
+                self.process_l1_batch(
+                    ctx,
+                    &mut *batch_executor,
+                    &mut updates_manager,
+                    protocol_upgrade_tx,
+                )
+                .await.wrap("process_l1_batch")?;
+
+                // Finish current batch.
+                if !updates_manager.l2_block.executed_transactions.is_empty() {
+                    self.seal_l2_block(&updates_manager).await?;
+                    // We've sealed the L2 block that we had, but we still need to set up the timestamp
+                    // for the fictive L2 block.
+                    let new_l2_block_params =
+                        self.wait_for_new_l2_block_params(ctx, &updates_manager).await?;
+                    Self::start_next_l2_block(
+                        new_l2_block_params,
+                        &mut updates_manager,
+                        &mut *batch_executor,
+                    )
+                    .await?;
+                }
+
+                let (finished_batch, _) = batch_executor.finish_batch().await?;
+                let sealed_batch_protocol_version = updates_manager.protocol_version();
+                updates_manager.finish_batch(finished_batch);
+                let mut next_cursor = updates_manager.io_cursor();
+                self.output_handler
+                    .handle_l1_batch(Arc::new(updates_manager))
+                    .await
+                    .with_context(|| format!("failed sealing L1 batch {l1_batch_env:?}"))?;
+
+                if let Some(delta) = l1_batch_seal_delta {
+                    L1_BATCH_METRICS.seal_delta.observe((ctx.now()-delta).unsigned_abs());
+                }
+                l1_batch_seal_delta = Some(ctx.now());
+
+                // Start the new batch.
+                next_cursor.l1_batch += 1;
+                (system_env, l1_batch_env) = self.wait_for_new_batch_env(ctx, &next_cursor).await?;
+                updates_manager = UpdatesManager::new(&l1_batch_env, &system_env);
+                batch_executor = self
+                    .create_batch_executor(ctx, l1_batch_env.clone(), system_env.clone())
+                    .await?;
+
+                let version_changed = system_env.version != sealed_batch_protocol_version;
+                protocol_upgrade_tx = if version_changed {
+                    self.load_upgrade_tx(system_env.version).await?
+                } else {
+                    None
+                };
+            }
+        }.await;
+        match res {
             Ok(_) => unreachable!(),
-            Err(Error::Fatal(err)) => Err(err).context("state_keeper failed"),
-            Err(Error::Canceled) => {
+            Err(ctx::Error::Internal(err)) => Err(err.context("state_keeper failed")),
+            Err(ctx::Error::Canceled(_)) => {
                 tracing::info!("Stop signal received, state keeper is shutting down");
                 Ok(())
             }
         }
     }
 
-    /// Fallible version of `run` routine that allows to easily exit upon cancellation.
-    async fn run_inner(&mut self) -> Result<Infallible, Error> {
-        let (cursor, pending_batch_params) = self.io.initialize().await?;
-        self.output_handler.initialize(&cursor).await?;
-        tracing::info!(
-            "Starting state keeper. Next l1 batch to seal: {}, next L2 block to seal: {}",
-            cursor.l1_batch,
-            cursor.next_l2_block
-        );
-
-        // Re-execute pending batch if it exists. Otherwise, initialize a new batch.
-        let PendingBatchData {
-            mut l1_batch_env,
-            mut system_env,
-            pending_l2_blocks,
-        } = match pending_batch_params {
-            Some(params) => {
-                tracing::info!(
-                    "There exists a pending batch consisting of {} L2 blocks, the first one is {}",
-                    params.pending_l2_blocks.len(),
-                    params
-                        .pending_l2_blocks
-                        .first()
-                        .context("expected at least one pending L2 block")?
-                        .number
-                );
-                params
-            }
-            None => {
-                tracing::info!("There is no open pending batch, starting a new empty batch");
-                let (system_env, l1_batch_env) = self
-                    .wait_for_new_batch_env(&cursor)
-                    .await
-                    .map_err(|e| e.context("wait_for_new_batch_params()"))?;
-                PendingBatchData {
-                    l1_batch_env,
-                    pending_l2_blocks: Vec::new(),
-                    system_env,
-                }
-            }
-        };
-
-        let protocol_version = system_env.version;
-        let mut updates_manager = UpdatesManager::new(&l1_batch_env, &system_env);
-        let mut protocol_upgrade_tx: Option<ProtocolUpgradeTx> = self
-            .load_protocol_upgrade_tx(&pending_l2_blocks, protocol_version, l1_batch_env.number)
-            .await?;
-
-        let mut batch_executor = self
-            .create_batch_executor(l1_batch_env.clone(), system_env.clone())
-            .await?;
-        self.restore_state(
-            &mut *batch_executor,
-            &mut updates_manager,
-            pending_l2_blocks,
-        )
-        .await?;
-
-        let mut l1_batch_seal_delta: Option<Instant> = None;
-        while !self.is_canceled() {
-            // This function will run until the batch can be sealed.
-            self.process_l1_batch(
-                &mut *batch_executor,
-                &mut updates_manager,
-                protocol_upgrade_tx,
-            )
-            .await?;
-
-            // Finish current batch.
-            if !updates_manager.l2_block.executed_transactions.is_empty() {
-                self.seal_l2_block(&updates_manager).await?;
-                // We've sealed the L2 block that we had, but we still need to set up the timestamp
-                // for the fictive L2 block.
-                let new_l2_block_params =
-                    self.wait_for_new_l2_block_params(&updates_manager).await?;
-                Self::start_next_l2_block(
-                    new_l2_block_params,
-                    &mut updates_manager,
-                    &mut *batch_executor,
-                )
-                .await?;
-            }
-
-            let (finished_batch, _) = batch_executor.finish_batch().await?;
-            let sealed_batch_protocol_version = updates_manager.protocol_version();
-            updates_manager.finish_batch(finished_batch);
-            let mut next_cursor = updates_manager.io_cursor();
-            self.output_handler
-                .handle_l1_batch(Arc::new(updates_manager))
-                .await
-                .with_context(|| format!("failed sealing L1 batch {l1_batch_env:?}"))?;
-
-            if let Some(delta) = l1_batch_seal_delta {
-                L1_BATCH_METRICS.seal_delta.observe(delta.elapsed());
-            }
-            l1_batch_seal_delta = Some(Instant::now());
-
-            // Start the new batch.
-            next_cursor.l1_batch += 1;
-            (system_env, l1_batch_env) = self.wait_for_new_batch_env(&next_cursor).await?;
-            updates_manager = UpdatesManager::new(&l1_batch_env, &system_env);
-            batch_executor = self
-                .create_batch_executor(l1_batch_env.clone(), system_env.clone())
-                .await?;
-
-            let version_changed = system_env.version != sealed_batch_protocol_version;
-            protocol_upgrade_tx = if version_changed {
-                self.load_upgrade_tx(system_env.version).await?
-            } else {
-                None
-            };
-        }
-        Err(Error::Canceled)
-    }
-
     async fn create_batch_executor(
         &mut self,
+        ctx: &ctx::Ctx,
         l1_batch_env: L1BatchEnv,
         system_env: SystemEnv,
-    ) -> Result<Box<dyn BatchExecutor<OwnedStorage>>, Error> {
+    ) -> ctx::Result<Box<dyn BatchExecutor<OwnedStorage>>> {
         let storage = self
             .storage_factory
-            .access_storage(&self.stop_receiver, l1_batch_env.number - 1)
+            .access_storage(ctx, l1_batch_env.number - 1)
             .await
-            .context("failed creating VM storage")?
-            .ok_or(Error::Canceled)?;
+            .wrap("failed creating VM storage")?;
         Ok(self
             .batch_executor
             .init_batch(storage, l1_batch_env, system_env))
@@ -241,7 +199,7 @@ impl ZkSyncStateKeeper {
         pending_l2_blocks: &[L2BlockExecutionData],
         protocol_version: ProtocolVersionId,
         l1_batch_number: L1BatchNumber,
-    ) -> Result<Option<ProtocolUpgradeTx>, Error> {
+    ) -> ctx::Result<Option<ProtocolUpgradeTx>> {
         // After the Shared Bridge is integrated,
         // there has to be a setChainId upgrade transaction after the chain genesis.
         // It has to be the first transaction of the first batch.
@@ -282,10 +240,6 @@ impl ZkSyncStateKeeper {
         Ok(protocol_upgrade_tx)
     }
 
-    fn is_canceled(&self) -> bool {
-        *self.stop_receiver.borrow()
-    }
-
     async fn load_upgrade_tx(
         &mut self,
         protocol_version: ProtocolVersionId,
@@ -302,35 +256,14 @@ impl ZkSyncStateKeeper {
             l1_batch = %cursor.l1_batch,
         )
     )]
-    async fn wait_for_new_batch_params(
-        &mut self,
-        cursor: &IoCursor,
-    ) -> Result<L1BatchParams, Error> {
-        while !self.is_canceled() {
-            if let Some(params) = self
-                .io
-                .wait_for_new_batch_params(cursor, POLL_WAIT_DURATION)
-                .await?
-            {
-                return Ok(params);
-            }
-        }
-        Err(Error::Canceled)
-    }
-
-    #[tracing::instrument(
-        skip_all,
-        fields(
-            l1_batch = %cursor.l1_batch,
-        )
-    )]
     async fn wait_for_new_batch_env(
         &mut self,
+        ctx: &ctx::Ctx,
         cursor: &IoCursor,
-    ) -> Result<(SystemEnv, L1BatchEnv), Error> {
+    ) -> ctx::Result<(SystemEnv, L1BatchEnv)> {
         // `io.wait_for_new_batch_params(..)` is not cancel-safe; once we get new batch params, we must hold onto them
         // until we get the rest of parameters from I/O or receive a stop signal.
-        let params = self.wait_for_new_batch_params(cursor).await?;
+        let params = self.io.wait_for_new_batch_params(ctx, cursor).await?;
         let contracts = self
             .io
             .load_base_system_contracts(params.protocol_version, cursor)
@@ -343,13 +276,8 @@ impl ZkSyncStateKeeper {
             })?;
 
         // `select!` is safe to use here; `io.load_batch_state_hash(..)` is cancel-safe by contract
-        tokio::select! {
-            hash_result = self.io.load_batch_state_hash(cursor.l1_batch - 1) => {
-                let previous_batch_hash = hash_result.context("cannot load state hash for previous L1 batch")?;
-                Ok(params.into_env(self.io.chain_id(), contracts, cursor, previous_batch_hash))
-            }
-            _ = self.stop_receiver.changed() => Err(Error::Canceled),
-        }
+        let previous_batch_hash = self.io.load_batch_state_hash(cursor.l1_batch - 1).await.context("cannot load state hash for previous L1 batch")?;
+        Ok(params.into_env(self.io.chain_id(), contracts, cursor, previous_batch_hash))
     }
 
     #[tracing::instrument(
@@ -361,22 +289,18 @@ impl ZkSyncStateKeeper {
     )]
     async fn wait_for_new_l2_block_params(
         &mut self,
+        ctx: &ctx::Ctx,
         updates: &UpdatesManager,
-    ) -> Result<L2BlockParams, Error> {
+    ) -> ctx::Result<L2BlockParams> {
         let latency = KEEPER_METRICS.wait_for_l2_block_params.start();
         let cursor = updates.io_cursor();
-        while !self.is_canceled() {
-            if let Some(params) = self
-                .io
-                .wait_for_new_l2_block_params(&cursor, POLL_WAIT_DURATION)
-                .await
-                .context("error waiting for new L2 block params")?
-            {
-                latency.observe();
-                return Ok(params);
-            }
-        }
-        Err(Error::Canceled)
+        let params = self
+            .io
+            .wait_for_new_l2_block_params(ctx, &cursor)
+            .await
+            .wrap("error waiting for new L2 block params")?;
+        latency.observe();
+        Ok(params)
     }
 
     #[tracing::instrument(
@@ -431,10 +355,11 @@ impl ZkSyncStateKeeper {
     )]
     async fn restore_state(
         &mut self,
+        ctx: &ctx::Ctx,
         batch_executor: &mut dyn BatchExecutor<OwnedStorage>,
         updates_manager: &mut UpdatesManager,
         l2_blocks_to_reexecute: Vec<L2BlockExecutionData>,
-    ) -> Result<(), Error> {
+    ) -> ctx::Result<()> {
         if l2_blocks_to_reexecute.is_empty() {
             return Ok(());
         }
@@ -526,9 +451,9 @@ impl ZkSyncStateKeeper {
 
         // We've processed all the L2 blocks, and right now we're initializing the next *actual* L2 block.
         let new_l2_block_params = self
-            .wait_for_new_l2_block_params(updates_manager)
+            .wait_for_new_l2_block_params(ctx,updates_manager)
             .await
-            .map_err(|e| e.context("wait_for_new_l2_block_params"))?;
+            .wrap("wait_for_new_l2_block_params")?;
         Self::start_next_l2_block(new_l2_block_params, updates_manager, batch_executor).await?;
 
         Ok(())
@@ -540,16 +465,17 @@ impl ZkSyncStateKeeper {
     )]
     async fn process_l1_batch(
         &mut self,
+        ctx: &ctx::Ctx,
         batch_executor: &mut dyn BatchExecutor<OwnedStorage>,
         updates_manager: &mut UpdatesManager,
         protocol_upgrade_tx: Option<ProtocolUpgradeTx>,
-    ) -> Result<(), Error> {
+    ) -> ctx::Result<()> {
         if let Some(protocol_upgrade_tx) = protocol_upgrade_tx {
             self.process_upgrade_tx(batch_executor, updates_manager, protocol_upgrade_tx)
                 .await?;
         }
 
-        while !self.is_canceled() {
+        while ctx.is_active() {
             let full_latency = KEEPER_METRICS.process_l1_batch_loop_iteration.start();
 
             if self
@@ -572,9 +498,9 @@ impl ZkSyncStateKeeper {
                 self.seal_l2_block(updates_manager).await?;
 
                 let new_l2_block_params = self
-                    .wait_for_new_l2_block_params(updates_manager)
+                    .wait_for_new_l2_block_params(ctx, updates_manager)
                     .await
-                    .map_err(|e| e.context("wait_for_new_l2_block_params"))?;
+                    .wrap("wait_for_new_l2_block_params")?;
                 tracing::debug!(
                     "Initialized new L2 block #{} (L1 batch #{}) with timestamp {}",
                     updates_manager.l2_block.number + 1,
@@ -586,17 +512,12 @@ impl ZkSyncStateKeeper {
             }
 
             let waiting_latency = KEEPER_METRICS.waiting_for_tx.start();
-            let Some(tx) = self
+            let tx = self
                 .io
-                .wait_for_next_tx(POLL_WAIT_DURATION)
+                .wait_for_next_tx(ctx)
                 .instrument(info_span!("wait_for_next_tx"))
                 .await
-                .context("error waiting for next transaction")?
-            else {
-                waiting_latency.observe();
-                tracing::trace!("No new transactions. Waiting!");
-                continue;
-            };
+                .context("error waiting for next transaction")?;
             waiting_latency.observe();
 
             let tx_hash = tx.hash();
@@ -664,7 +585,7 @@ impl ZkSyncStateKeeper {
             }
             full_latency.observe();
         }
-        Err(Error::Canceled)
+        Err(ctx::Canceled.into())
     }
 
     async fn process_upgrade_tx(

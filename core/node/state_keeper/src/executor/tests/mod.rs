@@ -1,7 +1,7 @@
 // FIXME: move storage-agnostic tests to VM executor crate
 
 use assert_matches::assert_matches;
-use rand::{thread_rng, Rng};
+use rand::{Rng as _};
 use test_casing::{test_casing, Product};
 use zksync_dal::{ConnectionPool, Core};
 use zksync_multivm::interface::{BatchTransactionExecutionResult, ExecutionResult, Halt};
@@ -9,6 +9,7 @@ use zksync_test_account::Account;
 use zksync_types::{
     get_nonce_key, utils::storage_key_for_eth_balance, vm::FastVmMode, PriorityOpId,
 };
+use zksync_concurrency::{ctx,scope,testonly::abort_on_panic};
 
 use self::tester::{
     AccountFailedCall, AccountLoadNextExecutable, StorageSnapshot, TestConfig, Tester,
@@ -55,16 +56,21 @@ const FAST_VM_MODES: [FastVmMode; 3] = [FastVmMode::Old, FastVmMode::New, FastVm
 #[test_casing(9, Product((StorageType::ALL, FAST_VM_MODES)))]
 #[tokio::test]
 async fn execute_l2_tx(storage_type: StorageType, vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester.create_batch_executor(storage_type).await;
-
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_executed(&res);
-    executor.finish_batch().await.unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester.create_batch_executor(ctx, storage_type).await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_executed(&res);
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -100,10 +106,12 @@ async fn execute_l2_tx_after_snapshot_recovery(
     mutation: Option<SnapshotRecoveryMutation>,
     storage_type: StorageType,
 ) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let mut alice = Account::random();
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
 
-    let mut storage_snapshot = StorageSnapshot::new(&connection_pool, &mut alice, 10).await;
+    let mut storage_snapshot = StorageSnapshot::new(ctx, &connection_pool, &mut alice, 10).await;
     assert!(storage_snapshot.storage_logs.len() > 10); // sanity check
     assert!(!storage_snapshot.factory_deps.is_empty());
     if let Some(mutation) = mutation {
@@ -112,22 +120,28 @@ async fn execute_l2_tx_after_snapshot_recovery(
     let snapshot = storage_snapshot.recover(&connection_pool).await;
 
     let mut tester = Tester::new(connection_pool, FastVmMode::Old);
-    let mut executor = tester
-        .recover_batch_executor_custom(&storage_type, &snapshot)
-        .await;
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    if mutation.is_none() {
-        assert_executed(&res);
-        executor.finish_batch().await.unwrap();
-    } else {
-        assert_rejected(&res);
-    }
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .recover_batch_executor_custom(ctx, &storage_type, &snapshot)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        if mutation.is_none() {
+            assert_executed(&res);
+            executor.finish_batch().await.unwrap();
+        } else {
+            assert_rejected(&res);
+        }
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can successfully execute a single L1 tx in batch executor.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn execute_l1_tx(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
@@ -135,48 +149,59 @@ async fn execute_l1_tx(vm_mode: FastVmMode) {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
-
-    let res = executor
-        .execute_tx(alice.l1_execute(PriorityOpId(1)))
-        .await
-        .unwrap();
-    assert_executed(&res);
-    executor.finish_batch().await.unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor
+            .execute_tx(alice.l1_execute(PriorityOpId(1)))
+            .await
+            .unwrap();
+        assert_executed(&res);
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can successfully execute a single L2 tx and a single L1 tx in batch executor.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn execute_l2_and_l1_txs(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_executed(&res);
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_executed(&res);
 
-    let res = executor
-        .execute_tx(alice.l1_execute(PriorityOpId(1)))
-        .await
-        .unwrap();
-    assert_executed(&res);
+        let res = executor
+            .execute_tx(alice.l1_execute(PriorityOpId(1)))
+            .await
+            .unwrap();
+        assert_executed(&res);
 
-    executor.finish_batch().await.unwrap();
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can successfully rollback the transaction and execute it once again.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn rollback(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
@@ -184,47 +209,56 @@ async fn rollback(vm_mode: FastVmMode) {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let tx = alice.execute();
-    let res_old = executor.execute_tx(tx.clone()).await.unwrap();
-    assert_executed(&res_old);
+        let tx = alice.execute();
+        let res_old = executor.execute_tx(tx.clone()).await.unwrap();
+        assert_executed(&res_old);
 
-    executor.rollback_last_tx().await.unwrap();
+        executor.rollback_last_tx().await.unwrap();
 
-    // Execute the same transaction, it must succeed.
-    let res_new = executor.execute_tx(tx.clone()).await.unwrap();
-    assert_executed(&res_new);
+        // Execute the same transaction, it must succeed.
+        let res_new = executor.execute_tx(tx.clone()).await.unwrap();
+        assert_executed(&res_new);
 
-    let tx_metrics_old = res_old.tx_result.get_execution_metrics(Some(&tx));
-    let tx_metrics_new = res_new.tx_result.get_execution_metrics(Some(&tx));
-    assert_eq!(
-        tx_metrics_old, tx_metrics_new,
-        "Execution results must be the same"
-    );
+        let tx_metrics_old = res_old.tx_result.get_execution_metrics(Some(&tx));
+        let tx_metrics_new = res_new.tx_result.get_execution_metrics(Some(&tx));
+        assert_eq!(
+            tx_metrics_old, tx_metrics_new,
+            "Execution results must be the same"
+        );
 
-    executor.finish_batch().await.unwrap();
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that incorrect transactions are marked as rejected.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn reject_tx(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
+    scope::run!(ctx, |ctx,s| async {
+        tester.genesis().await;
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    tester.genesis().await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
-
-    // Wallet is not funded, it can't pay for fees.
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_rejected(&res);
+        // Wallet is not funded, it can't pay for fees.
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_rejected(&res);
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that tx with too big gas limit is correctly processed.
@@ -232,102 +266,124 @@ async fn reject_tx(vm_mode: FastVmMode) {
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn too_big_gas_limit(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let big_gas_limit_tx = alice.execute_with_gas_limit(u32::MAX);
 
-    let big_gas_limit_tx = alice.execute_with_gas_limit(u32::MAX);
-
-    let res = executor.execute_tx(big_gas_limit_tx).await.unwrap();
-    assert_executed(&res);
-    executor.finish_batch().await.unwrap();
+        let res = executor.execute_tx(big_gas_limit_tx).await.unwrap();
+        assert_executed(&res);
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can't execute the same transaction twice.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn tx_cant_be_reexecuted(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let tx = alice.execute();
+        let res1 = executor.execute_tx(tx.clone()).await.unwrap();
+        assert_executed(&res1);
 
-    let tx = alice.execute();
-    let res1 = executor.execute_tx(tx.clone()).await.unwrap();
-    assert_executed(&res1);
-
-    // Nonce is used for the second tx.
-    let res2 = executor.execute_tx(tx).await.unwrap();
-    assert_rejected(&res2);
+        // Nonce is used for the second tx.
+        let res2 = executor.execute_tx(tx).await.unwrap();
+        assert_rejected(&res2);
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can deploy and call the loadnext contract.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn deploy_and_call_loadtest(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
-
-    let tx = alice.deploy_loadnext_tx();
-    assert_executed(&executor.execute_tx(tx.tx).await.unwrap());
-    assert_executed(
-        &executor
-            .execute_tx(alice.loadnext_custom_gas_call(tx.address, 10, 10_000_000))
-            .await
-            .unwrap(),
-    );
-    assert_executed(
-        &executor
-            .execute_tx(alice.loadnext_custom_writes_call(tx.address, 1, 500_000_000))
-            .await
-            .unwrap(),
-    );
-    executor.finish_batch().await.unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let tx = alice.deploy_loadnext_tx();
+        assert_executed(&executor.execute_tx(tx.tx).await.unwrap());
+        assert_executed(
+            &executor
+                .execute_tx(alice.loadnext_custom_gas_call(tx.address, 10, 10_000_000))
+                .await
+                .unwrap(),
+        );
+        assert_executed(
+            &executor
+                .execute_tx(alice.loadnext_custom_writes_call(tx.address, 1, 500_000_000))
+                .await
+                .unwrap(),
+        );
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn deploy_failedcall(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
     let mut tester = Tester::new(connection_pool, vm_mode);
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let tx = alice.deploy_failedcall_tx();
 
-    let tx = alice.deploy_failedcall_tx();
+        let execute_tx = executor.execute_tx(tx.tx).await.unwrap();
+        assert_executed(&execute_tx);
 
-    let execute_tx = executor.execute_tx(tx.tx).await.unwrap();
-    assert_executed(&execute_tx);
-
-    executor.finish_batch().await.unwrap();
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that a tx that is reverted by the VM still can be included into a batch.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn execute_reverted_tx(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
@@ -335,23 +391,27 @@ async fn execute_reverted_tx(vm_mode: FastVmMode) {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let tx = alice.deploy_loadnext_tx();
-    assert_executed(&executor.execute_tx(tx.tx).await.unwrap());
+        let tx = alice.deploy_loadnext_tx();
+        assert_executed(&executor.execute_tx(tx.tx).await.unwrap());
 
-    assert_reverted(
-        &executor
-            .execute_tx(alice.loadnext_custom_writes_call(
-                tx.address, 1,
-                1_000_000, // We provide enough gas for tx to be executed, but not enough for the call to be successful.
-            ))
-            .await
-            .unwrap(),
-    );
-    executor.finish_batch().await.unwrap();
+        assert_reverted(
+            &executor
+                .execute_tx(alice.loadnext_custom_writes_call(
+                    tx.address, 1,
+                    1_000_000, // We provide enough gas for tx to be executed, but not enough for the call to be successful.
+                ))
+                .await
+                .unwrap(),
+        );
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Runs the batch executor through a semi-realistic basic scenario:
@@ -359,6 +419,8 @@ async fn execute_reverted_tx(vm_mode: FastVmMode) {
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn execute_realistic_scenario(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
     let mut bob = Account::random();
@@ -368,59 +430,65 @@ async fn execute_realistic_scenario(vm_mode: FastVmMode) {
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
     tester.fund(&[bob.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    // A good tx should be executed successfully.
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_executed(&res);
+        // A good tx should be executed successfully.
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_executed(&res);
 
-    // Execute a good tx successfully, roll if back, and execute it again.
-    let tx_to_be_rolled_back = alice.execute();
-    let res = executor
-        .execute_tx(tx_to_be_rolled_back.clone())
-        .await
-        .unwrap();
-    assert_executed(&res);
+        // Execute a good tx successfully, roll if back, and execute it again.
+        let tx_to_be_rolled_back = alice.execute();
+        let res = executor
+            .execute_tx(tx_to_be_rolled_back.clone())
+            .await
+            .unwrap();
+        assert_executed(&res);
 
-    executor.rollback_last_tx().await.unwrap();
+        executor.rollback_last_tx().await.unwrap();
 
-    let res = executor
-        .execute_tx(tx_to_be_rolled_back.clone())
-        .await
-        .unwrap();
-    assert_executed(&res);
+        let res = executor
+            .execute_tx(tx_to_be_rolled_back.clone())
+            .await
+            .unwrap();
+        assert_executed(&res);
 
-    // A good tx from a different account should be executed successfully.
-    let res = executor.execute_tx(bob.execute()).await.unwrap();
-    assert_executed(&res);
+        // A good tx from a different account should be executed successfully.
+        let res = executor.execute_tx(bob.execute()).await.unwrap();
+        assert_executed(&res);
 
-    // If we try to execute an already executed again it should be rejected.
-    let res = executor.execute_tx(tx_to_be_rolled_back).await.unwrap();
-    assert_rejected(&res);
+        // If we try to execute an already executed again it should be rejected.
+        let res = executor.execute_tx(tx_to_be_rolled_back).await.unwrap();
+        assert_rejected(&res);
 
-    // An unrelated good tx should be executed successfully.
-    executor.rollback_last_tx().await.unwrap(); // Roll back the vm to the pre-rejected-tx state.
+        // An unrelated good tx should be executed successfully.
+        executor.rollback_last_tx().await.unwrap(); // Roll back the vm to the pre-rejected-tx state.
 
-    // No need to reset the nonce because a tx with the current nonce was indeed executed.
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_executed(&res);
+        // No need to reset the nonce because a tx with the current nonce was indeed executed.
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_executed(&res);
 
-    // A good L1 tx should also be executed successfully.
-    let res = executor
-        .execute_tx(alice.l1_execute(PriorityOpId(1)))
-        .await
-        .unwrap();
-    assert_executed(&res);
+        // A good L1 tx should also be executed successfully.
+        let res = executor
+            .execute_tx(alice.l1_execute(PriorityOpId(1)))
+            .await
+            .unwrap();
+        assert_executed(&res);
 
-    executor.finish_batch().await.unwrap();
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we handle the bootloader out of gas error on execution phase.
 #[test_casing(3, FAST_VM_MODES)]
 #[tokio::test]
 async fn bootloader_out_of_gas_for_any_tx(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
@@ -436,23 +504,29 @@ async fn bootloader_out_of_gas_for_any_tx(vm_mode: FastVmMode) {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_matches!(
-        res.tx_result.result,
-        ExecutionResult::Halt {
-            reason: Halt::BootloaderOutOfGas
-        }
-    );
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_matches!(
+            res.tx_result.result,
+            ExecutionResult::Halt {
+                reason: Halt::BootloaderOutOfGas
+            }
+        );
+        Ok(())
+    }).await.unwrap();
 }
 
 /// Checks that we can handle the bootloader out of gas error on tip phase.
 #[tokio::test]
 #[ignore] // This test fails.
 async fn bootloader_tip_out_of_gas() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
 
@@ -460,45 +534,52 @@ async fn bootloader_tip_out_of_gas() {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx,|ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
-    assert_executed(&res);
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
+        assert_executed(&res);
 
-    let (finished_batch, _) = executor.finish_batch().await.unwrap();
+        let (finished_batch, _) = executor.finish_batch().await.unwrap();
 
-    // Just a bit below the gas used for the previous batch execution should be fine to execute the tx
-    // but not enough to execute the block tip.
-    tester.set_config(TestConfig {
-        trace_calls: false,
-        vm_gas_limit: Some(
-            finished_batch
-                .block_tip_execution_result
-                .statistics
-                .computational_gas_used
-                - 10,
-        ),
-        validation_computational_gas_limit: u32::MAX,
-        fast_vm_mode: FastVmMode::Old,
-    });
+        // Just a bit below the gas used for the previous batch execution should be fine to execute the tx
+        // but not enough to execute the block tip.
+        tester.set_config(TestConfig {
+            trace_calls: false,
+            vm_gas_limit: Some(
+                finished_batch
+                    .block_tip_execution_result
+                    .statistics
+                    .computational_gas_used
+                    - 10,
+            ),
+            validation_computational_gas_limit: u32::MAX,
+            fast_vm_mode: FastVmMode::Old,
+        });
 
-    let mut second_executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+        let (mut second_executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let res = second_executor.execute_tx(alice.execute()).await.unwrap();
-    assert_matches!(
-        res.tx_result.result,
-        ExecutionResult::Halt {
-            reason: Halt::BootloaderOutOfGas
-        }
-    );
+        let res = second_executor.execute_tx(alice.execute()).await.unwrap();
+        assert_matches!(
+            res.tx_result.result,
+            ExecutionResult::Halt {
+                reason: Halt::BootloaderOutOfGas
+            }
+        );
+        Ok(())
+    }).await.unwrap();
 }
 
 #[tokio::test]
 async fn catchup_rocksdb_cache() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::constrained_test_pool(2).await;
     let mut alice = Account::random();
     let mut bob = Account::random();
@@ -508,37 +589,45 @@ async fn catchup_rocksdb_cache() {
     tester.genesis().await;
     tester.fund(&[alice.address(), bob.address()]).await;
 
-    // Execute a bunch of transactions to populate Postgres-based storage (note that RocksDB stays empty)
-    let mut executor = tester.create_batch_executor(StorageType::Postgres).await;
-    for _ in 0..10 {
-        let res = executor.execute_tx(alice.execute()).await.unwrap();
-        assert_executed(&res);
-    }
-
-    // Execute one more tx on PG
     let tx = alice.execute();
-    let res = executor.execute_tx(tx.clone()).await.unwrap();
-    assert_executed(&res);
-    executor.finish_batch().await.unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        // Execute a bunch of transactions to populate Postgres-based storage (note that RocksDB stays empty)
+        let (mut executor,task) = tester.create_batch_executor(ctx, StorageType::Postgres).await;
+        s.spawn_bg(task.run(ctx));
+        for _ in 0..10 {
+            let res = executor.execute_tx(alice.execute()).await.unwrap();
+            assert_executed(&res);
+        }
 
-    // Async RocksDB cache should be aware of the tx and should reject it
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
-    let res = executor.execute_tx(tx.clone()).await.unwrap();
-    assert_rejected(&res);
-    // Execute one tx just so we can finish the batch
-    executor.rollback_last_tx().await.unwrap(); // Roll back the vm to the pre-rejected-tx state.
-    let res = executor.execute_tx(bob.execute()).await.unwrap();
-    assert_executed(&res);
-    executor.finish_batch().await.unwrap();
+        // Execute one more tx on PG
+        let res = executor.execute_tx(tx.clone()).await.unwrap();
+        assert_executed(&res);
+        executor.finish_batch().await.unwrap();
+
+        // Async RocksDB cache should be aware of the tx and should reject it
+        let (mut executor, task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor.execute_tx(tx.clone()).await.unwrap();
+        assert_rejected(&res);
+        // Execute one tx just so we can finish the batch
+        executor.rollback_last_tx().await.unwrap(); // Roll back the vm to the pre-rejected-tx state.
+        let res = executor.execute_tx(bob.execute()).await.unwrap();
+        assert_executed(&res);
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
     // Wait for all background tasks to exit, otherwise we might still be holding a RocksDB lock
-    tester.wait_for_tasks().await;
 
-    // Sync RocksDB storage should be aware of the tx and should reject it
-    let mut executor = tester.create_batch_executor(StorageType::Rocksdb).await;
-    let res = executor.execute_tx(tx).await.unwrap();
-    assert_rejected(&res);
+    scope::run!(ctx, |ctx,s| async {
+        // Sync RocksDB storage should be aware of the tx and should reject it
+        let (mut executor,task) = tester.create_batch_executor(ctx, StorageType::Rocksdb).await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor.execute_tx(tx).await.unwrap();
+        assert_rejected(&res);
+        Ok(())
+    }).await.unwrap();
 }
 
 #[test_casing(3, FAST_VM_MODES)]
@@ -548,35 +637,43 @@ async fn execute_tx_with_large_packable_bytecode(vm_mode: FastVmMode) {
     // which should fit into a batch
     const BYTECODE_LEN: usize = 350_016 + 32; // +32 to ensure validity of the bytecode
 
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
     let mut tester = Tester::new(connection_pool, vm_mode);
-    let mut rng = thread_rng();
+    let mut rng = ctx.rng();
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
 
-    let mut packable_bytecode = vec![];
-    while packable_bytecode.len() < BYTECODE_LEN {
-        packable_bytecode.extend_from_slice(&if rng.gen() { [0_u8; 8] } else { [0xff_u8; 8] });
-    }
-    let tx = alice.execute_with_factory_deps(vec![packable_bytecode.clone()]);
+        let mut packable_bytecode = vec![];
+        while packable_bytecode.len() < BYTECODE_LEN {
+            packable_bytecode.extend_from_slice(&if rng.gen() { [0_u8; 8] } else { [0xff_u8; 8] });
+        }
+        let tx = alice.execute_with_factory_deps(vec![packable_bytecode.clone()]);
 
-    let res = executor.execute_tx(tx).await.unwrap();
-    assert_matches!(res.tx_result.result, ExecutionResult::Success { .. });
-    assert_eq!(res.compressed_bytecodes.len(), 1);
-    assert_eq!(res.compressed_bytecodes[0].original, packable_bytecode);
-    assert!(res.compressed_bytecodes[0].compressed.len() < BYTECODE_LEN / 2);
+        let res = executor.execute_tx(tx).await.unwrap();
+        assert_matches!(res.tx_result.result, ExecutionResult::Success { .. });
+        assert_eq!(res.compressed_bytecodes.len(), 1);
+        assert_eq!(res.compressed_bytecodes[0].original, packable_bytecode);
+        assert!(res.compressed_bytecodes[0].compressed.len() < BYTECODE_LEN / 2);
 
-    executor.finish_batch().await.unwrap();
+        executor.finish_batch().await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[test_casing(2, [FastVmMode::Old, FastVmMode::Shadow])] // new VM doesn't support call tracing yet
 #[tokio::test]
 async fn execute_tx_with_call_traces(vm_mode: FastVmMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let mut alice = Account::random();
     let mut tester = Tester::with_config(
@@ -589,11 +686,15 @@ async fn execute_tx_with_call_traces(vm_mode: FastVmMode) {
 
     tester.genesis().await;
     tester.fund(&[alice.address()]).await;
-    let mut executor = tester
-        .create_batch_executor(StorageType::AsyncRocksdbCache)
-        .await;
-    let res = executor.execute_tx(alice.execute()).await.unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        let (mut executor,task) = tester
+            .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+            .await;
+        s.spawn_bg(task.run(ctx));
+        let res = executor.execute_tx(alice.execute()).await.unwrap();
 
-    assert_matches!(res.tx_result.result, ExecutionResult::Success { .. });
-    assert!(!res.call_traces.is_empty());
+        assert_matches!(res.tx_result.result, ExecutionResult::Success { .. });
+        assert!(!res.call_traces.is_empty());
+        Ok(())
+    }).await.unwrap();
 }

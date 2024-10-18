@@ -4,7 +4,6 @@
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use tempfile::TempDir;
-use tokio::{sync::watch, task::JoinHandle};
 use zksync_config::configs::chain::StateKeeperConfig;
 use zksync_contracts::{
     get_loadnext_contract, load_contract, read_bytecode,
@@ -19,9 +18,10 @@ use zksync_multivm::{
     utils::StorageWritesDeduplicator,
     vm_latest::constants::INITIAL_STORAGE_WRITE_PUBDATA_BYTES,
 };
+use zksync_concurrency::{ctx,scope};
 use zksync_node_genesis::{create_genesis_l1_batch, GenesisParams};
 use zksync_node_test_utils::{recover, Snapshot};
-use zksync_state::{OwnedStorage, ReadStorageFactory, RocksdbStorageOptions};
+use zksync_state::{AsyncCatchupTask,OwnedStorage, RocksdbStorageOptions};
 use zksync_test_account::{Account, DeployContractsTx, TxType};
 use zksync_types::{
     block::L2BlockHasher,
@@ -34,6 +34,7 @@ use zksync_types::{
     AccountTreeId, Address, Execute, L1BatchNumber, L2BlockNumber, PriorityOpId, ProtocolVersionId,
     StorageLog, Transaction, H256, L2_BASE_TOKEN_ADDRESS, U256,
 };
+use crate::state_keeper_storage::ReadStorageFactory;
 use zksync_utils::u256_to_h256;
 use zksync_vm_executor::batch::{MainBatchExecutorFactory, TraceCalls};
 
@@ -68,6 +69,18 @@ impl TestConfig {
     }
 }
 
+#[derive(Default)]
+struct Task(Option<AsyncCatchupTask>);
+
+impl Task {
+    pub(crate) async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
+        if let Some(task) = self.0 {
+            task.run(ctx).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Tester represents an entity that can initialize the state and create batch executors over this storage.
 /// Important: `Tester` must be a *sole* owner of the `ConnectionPool`, since the test pool cannot be shared.
 #[derive(Debug)]
@@ -76,7 +89,6 @@ pub(super) struct Tester {
     db_dir: TempDir,
     pool: ConnectionPool<Core>,
     config: TestConfig,
-    tasks: Vec<JoinHandle<()>>,
 }
 
 impl Tester {
@@ -90,7 +102,6 @@ impl Tester {
             db_dir: TempDir::new().unwrap(),
             pool,
             config,
-            tasks: Vec::new(),
         }
     }
 
@@ -102,59 +113,49 @@ impl Tester {
     /// This function intentionally uses sensible defaults to not introduce boilerplate.
     pub(super) async fn create_batch_executor(
         &mut self,
+        ctx: &ctx::Ctx,
         storage_type: StorageType,
-    ) -> Box<dyn BatchExecutor<OwnedStorage>> {
+    ) -> (Box<dyn BatchExecutor<OwnedStorage>>,Task) {
         let (l1_batch_env, system_env) = self.default_batch_params();
-        match storage_type {
+        let (state_keeper_storage,task) : (Arc<dyn ReadStorageFactory>,Task) = match storage_type {
             StorageType::AsyncRocksdbCache => {
-                let (l1_batch_env, system_env) = self.default_batch_params();
                 let (state_keeper_storage, task) = AsyncRocksdbCache::new(
                     self.pool(),
                     self.state_keeper_db_path(),
                     RocksdbStorageOptions::default(),
-                );
-                let handle = tokio::task::spawn(async move {
-                    let (_stop_sender, stop_receiver) = watch::channel(false);
-                    task.run(stop_receiver).await.unwrap()
-                });
-                self.tasks.push(handle);
-                self.create_batch_executor_inner(
-                    Arc::new(state_keeper_storage),
-                    l1_batch_env,
-                    system_env,
-                )
-                .await
+                ); 
+                (Arc::new(state_keeper_storage), Task(Some(task)))
             }
             StorageType::Rocksdb => {
-                self.create_batch_executor_inner(
-                    Arc::new(RocksdbStorageFactory::new(
-                        self.pool(),
-                        self.state_keeper_db_path(),
-                    )),
-                    l1_batch_env,
-                    system_env,
-                )
-                .await
+                let sks = Arc::new(RocksdbStorageFactory::new(
+                    self.pool(),
+                    self.state_keeper_db_path(),
+                ));
+                (sks, Task::default())
             }
-            StorageType::Postgres => {
-                self.create_batch_executor_inner(Arc::new(self.pool()), l1_batch_env, system_env)
-                    .await
-            }
-        }
+            StorageType::Postgres => (Arc::new(self.pool()), Task::default())
+        };
+        let executor = self.create_batch_executor_inner(
+            ctx,
+            state_keeper_storage,
+            l1_batch_env,
+            system_env,
+        )
+        .await;
+        (executor, task)
     }
 
     async fn create_batch_executor_inner(
         &self,
+        ctx: &ctx::Ctx,
         storage_factory: Arc<dyn ReadStorageFactory>,
         l1_batch_env: L1BatchEnv,
         system_env: SystemEnv,
     ) -> Box<dyn BatchExecutor<OwnedStorage>> {
-        let (_stop_sender, stop_receiver) = watch::channel(false);
         let storage = storage_factory
-            .access_storage(&stop_receiver, l1_batch_env.number - 1)
+            .access_storage(ctx, l1_batch_env.number - 1)
             .await
-            .expect("failed creating VM storage")
-            .unwrap();
+            .expect("failed creating VM storage");
         if self.config.trace_calls {
             let mut executor = MainBatchExecutorFactory::<TraceCalls>::new(false);
             executor.set_fast_vm_mode(self.config.fast_vm_mode);
@@ -168,46 +169,48 @@ impl Tester {
 
     pub(super) async fn recover_batch_executor(
         &mut self,
+        ctx: &ctx::Ctx,
         snapshot: &SnapshotRecoveryStatus,
-    ) -> Box<dyn BatchExecutor<OwnedStorage>> {
+    ) -> (Box<dyn BatchExecutor<OwnedStorage>>,Task) {
         let (storage_factory, task) = AsyncRocksdbCache::new(
             self.pool(),
             self.state_keeper_db_path(),
             RocksdbStorageOptions::default(),
         );
-        let (_, stop_receiver) = watch::channel(false);
-        let handle = tokio::task::spawn(async move { task.run(stop_receiver).await.unwrap() });
-        self.tasks.push(handle);
-        self.recover_batch_executor_inner(Arc::new(storage_factory), snapshot)
-            .await
+        let s = self.recover_batch_executor_inner(ctx, Arc::new(storage_factory), snapshot)
+            .await;
+        (s,Task(Some(task)))
     }
 
     pub(super) async fn recover_batch_executor_custom(
         &mut self,
+        ctx: &ctx::Ctx,
         storage_type: &StorageType,
         snapshot: &SnapshotRecoveryStatus,
-    ) -> Box<dyn BatchExecutor<OwnedStorage>> {
+    ) -> (Box<dyn BatchExecutor<OwnedStorage>>,Task) {
         match storage_type {
-            StorageType::AsyncRocksdbCache => self.recover_batch_executor(snapshot).await,
+            StorageType::AsyncRocksdbCache => self.recover_batch_executor(ctx, snapshot).await,
             StorageType::Rocksdb => {
-                self.recover_batch_executor_inner(
+                (self.recover_batch_executor_inner(
+                    ctx,
                     Arc::new(RocksdbStorageFactory::new(
                         self.pool(),
                         self.state_keeper_db_path(),
                     )),
                     snapshot,
                 )
-                .await
+                .await,Task::default())
             }
             StorageType::Postgres => {
-                self.recover_batch_executor_inner(Arc::new(self.pool()), snapshot)
-                    .await
+                (self.recover_batch_executor_inner(ctx, Arc::new(self.pool()), snapshot)
+                    .await,Task::default())
             }
         }
     }
 
     async fn recover_batch_executor_inner(
         &self,
+        ctx: &ctx::Ctx,
         storage_factory: Arc<dyn ReadStorageFactory>,
         snapshot: &SnapshotRecoveryStatus,
     ) -> Box<dyn BatchExecutor<OwnedStorage>> {
@@ -222,7 +225,7 @@ impl Tester {
             max_virtual_blocks_to_create: 1,
         };
 
-        self.create_batch_executor_inner(storage_factory, l1_batch_env, system_env)
+        self.create_batch_executor_inner(ctx,storage_factory, l1_batch_env, system_env)
             .await
     }
 
@@ -299,12 +302,6 @@ impl Tester {
                     .await
                     .unwrap();
             }
-        }
-    }
-
-    pub(super) async fn wait_for_tasks(&mut self) {
-        for task in self.tasks.drain(..) {
-            task.await.expect("Failed to join a task");
         }
     }
 
@@ -484,6 +481,7 @@ pub(super) struct StorageSnapshot {
 impl StorageSnapshot {
     /// Generates a new snapshot by executing the specified number of transactions, each in a separate L2 block.
     pub async fn new(
+        ctx: &ctx::Ctx,
         connection_pool: &ConnectionPool<Core>,
         alice: &mut Account,
         transaction_count: u32,
@@ -513,40 +511,44 @@ impl StorageSnapshot {
             .collect();
         drop(storage);
 
-        let mut executor = tester
-            .create_batch_executor(StorageType::AsyncRocksdbCache)
-            .await;
+        let mut storage_writes_deduplicator = StorageWritesDeduplicator::new();
         let mut l2_block_env = L2BlockEnv {
             number: 1,
             prev_block_hash: L2BlockHasher::legacy_hash(L2BlockNumber(0)),
             timestamp: 100,
             max_virtual_blocks_to_create: 1,
         };
-        let mut storage_writes_deduplicator = StorageWritesDeduplicator::new();
+        let finished_batch = scope::run!(ctx, |ctx,s| async {
+            let (mut executor,task) = tester
+                .create_batch_executor(ctx, StorageType::AsyncRocksdbCache)
+                .await;
+            s.spawn_bg(task.run(ctx));
+            for _ in 0..transaction_count {
+                let tx = alice.execute();
+                let tx_hash = tx.hash(); // probably incorrect
+                let res = executor.execute_tx(tx).await.unwrap();
+                assert!(!res.was_halted());
+                let tx_result = res.tx_result;
+                let storage_logs = &tx_result.logs.storage_logs;
+                storage_writes_deduplicator.apply(storage_logs.iter().filter(|log| log.log.is_write()));
 
-        for _ in 0..transaction_count {
-            let tx = alice.execute();
-            let tx_hash = tx.hash(); // probably incorrect
-            let res = executor.execute_tx(tx).await.unwrap();
-            assert!(!res.was_halted());
-            let tx_result = res.tx_result;
-            let storage_logs = &tx_result.logs.storage_logs;
-            storage_writes_deduplicator.apply(storage_logs.iter().filter(|log| log.log.is_write()));
+                let mut hasher = L2BlockHasher::new(
+                    L2BlockNumber(l2_block_env.number),
+                    l2_block_env.timestamp,
+                    l2_block_env.prev_block_hash,
+                );
+                hasher.push_tx_hash(tx_hash);
 
-            let mut hasher = L2BlockHasher::new(
-                L2BlockNumber(l2_block_env.number),
-                l2_block_env.timestamp,
-                l2_block_env.prev_block_hash,
-            );
-            hasher.push_tx_hash(tx_hash);
+                l2_block_env.number += 1;
+                l2_block_env.timestamp += 1;
+                l2_block_env.prev_block_hash = hasher.finalize(ProtocolVersionId::latest());
+                executor.start_next_l2_block(l2_block_env).await.unwrap();
+            }
 
-            l2_block_env.number += 1;
-            l2_block_env.timestamp += 1;
-            l2_block_env.prev_block_hash = hasher.finalize(ProtocolVersionId::latest());
-            executor.start_next_l2_block(l2_block_env).await.unwrap();
-        }
-
-        let (finished_batch, _) = executor.finish_batch().await.unwrap();
+            let (finished_batch, _) = executor.finish_batch().await.unwrap();
+            Ok(finished_batch)
+        }).await.unwrap();
+        
         let storage_logs = &finished_batch.block_tip_execution_result.logs.storage_logs;
         storage_writes_deduplicator.apply(storage_logs.iter().filter(|log| log.log.is_write()));
         let modified_entries = storage_writes_deduplicator.into_modified_key_values();

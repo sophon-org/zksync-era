@@ -23,16 +23,6 @@ use zksync_vm_executor::storage::L1BatchParamsProvider;
 
 use super::*;
 
-#[test]
-#[rustfmt::skip] // One-line formatting looks better here.
-fn test_poll_iters() {
-    assert_eq!(poll_iters(Duration::from_millis(100), Duration::from_millis(0)), 1);
-    assert_eq!(poll_iters(Duration::from_millis(100), Duration::from_millis(100)), 1);
-    assert_eq!(poll_iters(Duration::from_millis(100), Duration::from_millis(101)), 2);
-    assert_eq!(poll_iters(Duration::from_millis(100), Duration::from_millis(200)), 2);
-    assert_eq!(poll_iters(Duration::from_millis(100), Duration::from_millis(201)), 3);
-}
-
 #[tokio::test]
 async fn creating_io_cursor_with_genesis() {
     let pool = ConnectionPool::<Core>::test_pool().await;

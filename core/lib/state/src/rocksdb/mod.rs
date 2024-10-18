@@ -29,11 +29,11 @@ use std::{
 
 use anyhow::Context as _;
 use itertools::{Either, Itertools};
-use tokio::sync::watch;
 use zksync_dal::{Connection, Core, CoreDal, DalError};
 use zksync_storage::{db::NamedColumnFamily, RocksDB, RocksDBOptions};
 use zksync_types::{L1BatchNumber, StorageKey, StorageValue, H256};
 use zksync_vm_interface::storage::ReadStorage;
+use zksync_concurrency::{ctx,scope};
 
 #[cfg(test)]
 use self::tests::RocksdbStorageEventListener;
@@ -112,19 +112,6 @@ impl StateValue {
     }
 }
 
-/// Error emitted when [`RocksdbStorage`] is being updated.
-#[derive(Debug)]
-enum RocksdbSyncError {
-    Internal(anyhow::Error),
-    Interrupted,
-}
-
-impl From<anyhow::Error> for RocksdbSyncError {
-    fn from(err: anyhow::Error) -> Self {
-        Self::Internal(err)
-    }
-}
-
 /// Options for [`RocksdbStorage`].
 #[derive(Debug)]
 pub struct RocksdbStorageOptions {
@@ -188,10 +175,7 @@ impl RocksdbStorageBuilder {
 
     /// Returns the last processed l1 batch number + 1.
     ///
-    /// # Panics
-    ///
-    /// Panics on RocksDB errors.
-    pub async fn l1_batch_number(&self) -> Option<L1BatchNumber> {
+    pub async fn l1_batch_number(&self) -> anyhow::Result<Option<L1BatchNumber>> {
         self.0.l1_batch_number().await
     }
 
@@ -206,49 +190,36 @@ impl RocksdbStorageBuilder {
     /// Returns I/O RocksDB and Postgres errors.
     pub async fn ensure_ready(
         &mut self,
+        ctx: &ctx::Ctx,
         storage: &mut Connection<'_, Core>,
-        stop_receiver: &watch::Receiver<bool>,
-    ) -> anyhow::Result<bool> {
-        let ready_result = self
+    ) -> ctx::Result<bool> {
+        let (strategy, _) = self
             .0
             .ensure_ready(
+                ctx,
                 storage,
                 RocksdbStorage::DESIRED_LOG_CHUNK_SIZE,
-                stop_receiver,
             )
-            .await;
-        match ready_result {
-            Ok((strategy, _)) => Ok(matches!(strategy, Strategy::Recovery)),
-            Err(RocksdbSyncError::Interrupted) => Ok(false),
-            Err(RocksdbSyncError::Internal(err)) => Err(err),
-        }
+            .await?;
+        Ok(matches!(strategy, Strategy::Recovery))
     }
 
     /// Synchronizes this storage with Postgres using the provided connection.
-    ///
-    /// # Return value
-    ///
-    /// Returns `Ok(None)` if the update is interrupted using `stop_receiver`.
     ///
     /// # Errors
     ///
     /// - Errors if the local L1 batch number is greater than the last sealed L1 batch number
     ///   in Postgres.
     pub async fn synchronize(
-        self,
+        mut self,
+        ctx: &ctx::Ctx,
         storage: &mut Connection<'_, Core>,
-        stop_receiver: &watch::Receiver<bool>,
         to_l1_batch_number: Option<L1BatchNumber>,
-    ) -> anyhow::Result<Option<RocksdbStorage>> {
-        let mut inner = self.0;
-        match inner
-            .update_from_postgres(storage, stop_receiver, to_l1_batch_number)
-            .await
-        {
-            Ok(()) => Ok(Some(inner)),
-            Err(RocksdbSyncError::Interrupted) => Ok(None),
-            Err(RocksdbSyncError::Internal(err)) => Err(err),
-        }
+    ) -> ctx::Result<RocksdbStorage> {
+        self.0
+            .update_from_postgres(ctx, storage, to_l1_batch_number)
+            .await?;
+        Ok(self.0)
     }
 
     /// Reverts the state to a previous L1 batch number.
@@ -258,10 +229,11 @@ impl RocksdbStorageBuilder {
     /// Propagates RocksDB and Postgres errors.
     pub async fn roll_back(
         mut self,
+        ctx: &ctx::Ctx,
         storage: &mut Connection<'_, Core>,
         last_l1_batch_to_keep: L1BatchNumber,
     ) -> anyhow::Result<()> {
-        self.0.revert(storage, last_l1_batch_to_keep).await
+        self.0.revert(ctx, storage, last_l1_batch_to_keep).await
     }
 
     /// Returns the underlying storage without any checks. Should only be used in test code.
@@ -310,28 +282,23 @@ impl RocksdbStorage {
     }
 
     async fn new(path: PathBuf, options: RocksdbStorageOptions) -> anyhow::Result<Self> {
-        tokio::task::spawn_blocking(move || {
-            let db = RocksDB::with_options(&path, options.into_generic())
-                .context("failed initializing state keeper RocksDB")?;
-            Ok(Self {
-                db,
-                pending_patch: PendingPatch::default(),
-                #[cfg(test)]
-                listener: RocksdbStorageEventListener::default(),
-            })
+        Ok(Self {
+            db: scope::wait_blocking(|| RocksDB::with_options(&path, options.into_generic())).await
+                .context("failed initializing state keeper RocksDB")?,
+            pending_patch: PendingPatch::default(),
+            #[cfg(test)]
+            listener: RocksdbStorageEventListener::default(),
         })
-        .await
-        .context("panicked initializing state keeper RocksDB")?
     }
 
     async fn update_from_postgres(
         &mut self,
+        ctx: &ctx::Ctx,
         storage: &mut Connection<'_, Core>,
-        stop_receiver: &watch::Receiver<bool>,
         to_l1_batch_number: Option<L1BatchNumber>,
-    ) -> Result<(), RocksdbSyncError> {
+    ) -> ctx::Result<()> {
         let (_, mut current_l1_batch_number) = self
-            .ensure_ready(storage, Self::DESIRED_LOG_CHUNK_SIZE, stop_receiver)
+            .ensure_ready(ctx, storage, Self::DESIRED_LOG_CHUNK_SIZE)
             .await?;
 
         let latency = METRICS.update.start();
@@ -367,25 +334,22 @@ impl RocksdbStorage {
         }
 
         while current_l1_batch_number <= to_l1_batch_number {
-            if *stop_receiver.borrow() {
-                return Err(RocksdbSyncError::Interrupted);
-            }
             let current_lag = to_l1_batch_number.0 - current_l1_batch_number.0 + 1;
             METRICS.lag.set(current_lag.into());
 
             tracing::debug!("Loading state changes for l1 batch {current_l1_batch_number}");
-            let storage_logs = storage
+            let storage_logs = ctx.wait(storage
                 .storage_logs_dal()
-                .get_touched_slots_for_l1_batch(current_l1_batch_number)
-                .await
+                .get_touched_slots_for_l1_batch(current_l1_batch_number))
+                .await?
                 .map_err(DalError::generalize)?;
             self.apply_storage_logs(storage_logs, storage).await?;
 
             tracing::debug!("Loading factory deps for L1 batch {current_l1_batch_number}");
-            let factory_deps = storage
+            let factory_deps = ctx.wait(storage
                 .blocks_dal()
-                .get_l1_batch_factory_deps(current_l1_batch_number)
-                .await
+                .get_l1_batch_factory_deps(current_l1_batch_number))
+                .await?
                 .map_err(DalError::generalize)?;
             for (hash, bytecode) in factory_deps {
                 self.store_factory_dep(hash, bytecode);
@@ -416,10 +380,7 @@ impl RocksdbStorage {
         storage: &mut Connection<'_, Core>,
     ) -> anyhow::Result<()> {
         let db = self.db.clone();
-        let processed_logs =
-            tokio::task::spawn_blocking(move || Self::process_transaction_logs(&db, storage_logs))
-                .await
-                .context("panicked processing storage logs")?;
+        let processed_logs = scope::wait_blocking(|| Self::process_transaction_logs(&db, storage_logs)).await;
 
         let (logs_with_known_indices, logs_with_unknown_indices): (Vec<_>, Vec<_>) =
             processed_logs.into_iter().partition_map(
@@ -494,6 +455,7 @@ impl RocksdbStorage {
 
     async fn revert(
         &mut self,
+        ctx: &ctx::Ctx,
         connection: &mut Connection<'_, Core>,
         last_l1_batch_to_keep: L1BatchNumber,
     ) -> anyhow::Result<()> {
@@ -501,19 +463,19 @@ impl RocksdbStorage {
 
         tracing::info!("Getting logs that should be applied to revert the state...");
         let stage_start = Instant::now();
-        let logs = connection
+        let logs = ctx.wait(connection
             .storage_logs_dal()
-            .get_storage_logs_for_revert(last_l1_batch_to_keep)
-            .await
+            .get_storage_logs_for_revert(last_l1_batch_to_keep))
+            .await?
             .context("failed getting logs for revert")?;
         tracing::info!("Got {} logs, took {:?}", logs.len(), stage_start.elapsed());
 
         tracing::info!("Getting number of last L2 block for L1 batch #{last_l1_batch_to_keep}...");
         let stage_start = Instant::now();
-        let (_, last_l2_block_to_keep) = connection
+        let (_, last_l2_block_to_keep) = ctx.wait(connection
             .blocks_dal()
             .get_l2_block_range_of_l1_batch(last_l1_batch_to_keep)
-            .await?
+            ).await?.context("get_l2_block_range_of_l1_batch()")?
             .context("L1 batch should contain at least one L2 block")?;
         tracing::info!(
             "Got L2 block number {last_l2_block_to_keep}, took {:?}",
@@ -522,19 +484,18 @@ impl RocksdbStorage {
 
         tracing::info!("Getting factory deps that need to be removed...");
         let stage_start = Instant::now();
-        let factory_deps = connection
+        let factory_deps = ctx.wait(connection
             .factory_deps_dal()
             .get_factory_deps_for_revert(last_l2_block_to_keep)
-            .await?;
+        ).await?.context("get_factory_deps_for_revert()")?;
         tracing::info!(
             "Got {} factory deps, took {:?}",
             factory_deps.len(),
             stage_start.elapsed()
         );
 
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut batch = db.new_write_batch();
+        scope::wait_blocking(|| {
+            let mut batch = self.db.new_write_batch();
 
             let cf = StateKeeperColumnFamily::State;
             for (key, maybe_value) in logs {
@@ -559,20 +520,19 @@ impl RocksdbStorage {
                 batch.delete_cf(cf, factory_dep_hash.as_bytes());
             }
 
-            db.write(batch)
+            self.db.write(batch)
                 .context("failed to save state data into RocksDB")
         })
-        .await
-        .context("panicked during revert")?
+        .await?;
+        Ok(())
     }
 
     /// Saves the pending changes to RocksDB. Must be executed on a Tokio thread.
     async fn save(&mut self, l1_batch_number: Option<L1BatchNumber>) -> anyhow::Result<()> {
         let pending_patch = mem::take(&mut self.pending_patch);
 
-        let db = self.db.clone();
-        let save_task = tokio::task::spawn_blocking(move || {
-            let mut batch = db.new_write_batch();
+        scope::wait_blocking(|| {
+            let mut batch = self.db.new_write_batch();
             let cf = StateKeeperColumnFamily::State;
             if let Some(l1_batch_number) = l1_batch_number {
                 batch.put_cf(
@@ -593,28 +553,19 @@ impl RocksdbStorage {
             for (hash, value) in pending_patch.factory_deps {
                 batch.put_cf(cf, &hash.to_fixed_bytes(), value.as_ref());
             }
-            db.write(batch)
+            self.db.write(batch)
                 .context("failed to save state data into RocksDB")
-        });
-        save_task
-            .await
-            .context("panicked when saving state data into RocksDB")?
+        }).await
     }
 
     /// Returns the last processed l1 batch number + 1.
-    ///
-    /// # Panics
-    ///
-    /// Panics on RocksDB errors.
-    pub async fn l1_batch_number(&self) -> Option<L1BatchNumber> {
+    pub async fn l1_batch_number(&self) -> anyhow::Result<Option<L1BatchNumber>> {
         let cf = StateKeeperColumnFamily::State;
-        let db = self.db.clone();
         let number_bytes =
-            tokio::task::spawn_blocking(move || db.get_cf(cf, Self::L1_BATCH_NUMBER_KEY))
+            scope::wait_blocking(|| self.db.get_cf(cf, Self::L1_BATCH_NUMBER_KEY))
                 .await
-                .expect("failed getting L1 batch number from RocksDB")
-                .expect("failed getting L1 batch number from RocksDB");
-        number_bytes.map(|bytes| L1BatchNumber(deserialize_l1_batch_number(&bytes)))
+                .context("failed getting L1 batch number from RocksDB")?;
+        Ok(number_bytes.map(|bytes| L1BatchNumber(deserialize_l1_batch_number(&bytes))))
     }
 
     fn serialize_state_key(key: H256) -> [u8; 32] {

@@ -9,11 +9,10 @@ use std::{
     convert::TryInto,
     fmt, mem,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
+use zksync_concurrency::ctx;
 use async_trait::async_trait;
-use tokio::sync::watch;
 use zksync_contracts::BaseSystemContracts;
 use zksync_multivm::{
     interface::{
@@ -25,13 +24,14 @@ use zksync_multivm::{
     vm_latest::constants::BATCH_COMPUTATIONAL_GAS_LIMIT,
 };
 use zksync_node_test_utils::create_l2_transaction;
-use zksync_state::{interface::StorageView, OwnedStorage, ReadStorageFactory};
+use zksync_state::{interface::StorageView, OwnedStorage};
 use zksync_types::{
     fee_model::BatchFeeInput, l2_to_l1_log::UserL2ToL1Log, protocol_upgrade::ProtocolUpgradeTx,
     Address, L1BatchNumber, L2BlockNumber, L2ChainId, ProtocolVersionId, Transaction, H256,
 };
 
 use crate::{
+    state_keeper_storage::ReadStorageFactory,
     io::{IoCursor, L1BatchParams, L2BlockParams, PendingBatchData, StateKeeperIO},
     seal_criteria::{IoSealCriteria, SequencerSealer, UnexecutableReason},
     testonly::{successful_exec, BASE_SYSTEM_CONTRACTS},
@@ -196,38 +196,18 @@ impl TestScenario {
 
     /// Launches the test.
     /// Provided `SealManager` is expected to be externally configured to adhere the written scenario logic.
-    pub(crate) async fn run(self, sealer: SequencerSealer) {
+    pub(crate) async fn run(self, ctx: &ctx::Ctx, sealer: SequencerSealer) {
         assert!(!self.actions.is_empty(), "Test scenario can't be empty");
 
         let batch_executor = TestBatchExecutorBuilder::new(&self);
-        let (stop_sender, stop_receiver) = watch::channel(false);
-        let (io, output_handler) = TestIO::new(stop_sender, self);
-        let state_keeper = ZkSyncStateKeeper::new(
-            stop_receiver,
-            Box::new(io),
-            Box::new(batch_executor),
+        let (io, output_handler) = TestIO::new(self);
+        ZkSyncStateKeeper {
+            io: Box::new(io),
+            batch_executor: Box::new(batch_executor),
             output_handler,
-            Arc::new(sealer),
-            Arc::new(MockReadStorageFactory),
-        );
-        let sk_thread = tokio::spawn(state_keeper.run());
-
-        // We must assume that *theoretically* state keeper may ignore the stop signal from IO once scenario is
-        // completed, so we spawn it in a separate thread to not get test stuck.
-        let hard_timeout = Duration::from_secs(60);
-        let poll_interval = Duration::from_millis(50);
-        let start = Instant::now();
-        while start.elapsed() <= hard_timeout {
-            if sk_thread.is_finished() {
-                sk_thread
-                    .await
-                    .unwrap_or_else(|_| panic!("State keeper thread panicked"))
-                    .unwrap();
-                return;
-            }
-            tokio::time::sleep(poll_interval).await;
-        }
-        panic!("State keeper test did not exit until the hard timeout, probably it got stuck");
+            sealer: Arc::new(sealer),
+            storage_factory: Arc::new(MockReadStorageFactory),
+        }.run(ctx).await.unwrap();
     }
 }
 
@@ -506,20 +486,15 @@ impl BatchExecutor<OwnedStorage> for TestBatchExecutor {
 #[derive(Debug)]
 pub(super) struct TestPersistence {
     actions: Arc<Mutex<VecDeque<ScenarioItem>>>,
-    stop_sender: Arc<watch::Sender<bool>>,
 }
 
 impl TestPersistence {
     fn pop_next_item(&self, request: &str) -> ScenarioItem {
-        let mut actions = self.actions.lock().expect("scenario queue is poisoned");
-        let action = actions
+        self.actions
+            .lock()
+            .expect("scenario queue is poisoned")
             .pop_front()
-            .unwrap_or_else(|| panic!("no action for request: {request}"));
-        // If that was a last action, tell the state keeper to stop after that.
-        if actions.is_empty() {
-            self.stop_sender.send_replace(true);
-        }
-        action
+            .unwrap_or_else(|| panic!("no action for request: {request}"))
     }
 }
 
@@ -552,7 +527,6 @@ impl StateKeeperOutputHandler for TestPersistence {
 }
 
 pub(crate) struct TestIO {
-    stop_sender: Arc<watch::Sender<bool>>,
     batch_number: L1BatchNumber,
     timestamp: u64,
     fee_input: BatchFeeInput,
@@ -578,13 +552,10 @@ impl fmt::Debug for TestIO {
 
 impl TestIO {
     pub(crate) fn new(
-        stop_sender: watch::Sender<bool>,
         scenario: TestScenario,
     ) -> (Self, OutputHandler) {
-        let stop_sender = Arc::new(stop_sender);
         let actions = Arc::new(Mutex::new(scenario.actions));
         let persistence = TestPersistence {
-            stop_sender: stop_sender.clone(),
             actions: actions.clone(),
         };
 
@@ -601,7 +572,6 @@ impl TestIO {
             (L2BlockNumber(1), 1)
         };
         let this = Self {
-            stop_sender,
             batch_number: L1BatchNumber(1),
             timestamp,
             fee_input: BatchFeeInput::default(),
@@ -631,10 +601,6 @@ impl TestIO {
                     "Test scenario is empty, but the following action was done by the state keeper: {request}"
                 );
             });
-            // If that was a last action, tell the state keeper to stop after that.
-            if actions.is_empty() {
-                self.stop_sender.send_replace(true);
-            }
 
             match &action {
                 ScenarioItem::NoTxsUntilNextAction(_) => {
@@ -687,9 +653,9 @@ impl StateKeeperIO for TestIO {
 
     async fn wait_for_new_batch_params(
         &mut self,
+        _ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        _max_wait: Duration,
-    ) -> anyhow::Result<Option<L1BatchParams>> {
+    ) -> ctx::Result<L1BatchParams> {
         assert_eq!(cursor.next_l2_block, self.l2_block_number);
         assert_eq!(cursor.l1_batch, self.batch_number);
 
@@ -706,14 +672,14 @@ impl StateKeeperIO for TestIO {
         self.l2_block_number += 1;
         self.timestamp += 1;
         self.batch_number += 1;
-        Ok(Some(params))
+        Ok(params)
     }
 
     async fn wait_for_new_l2_block_params(
         &mut self,
+        _ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        _max_wait: Duration,
-    ) -> anyhow::Result<Option<L2BlockParams>> {
+    ) -> ctx::Result<L2BlockParams> {
         assert_eq!(cursor.next_l2_block, self.l2_block_number);
         let params = L2BlockParams {
             timestamp: self.timestamp,
@@ -722,29 +688,25 @@ impl StateKeeperIO for TestIO {
         };
         self.l2_block_number += 1;
         self.timestamp += 1;
-        Ok(Some(params))
+        Ok(params)
     }
 
     async fn wait_for_next_tx(
         &mut self,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<Transaction>> {
-        let action = self.pop_next_item("wait_for_next_tx");
-
+        ctx: &ctx::Ctx,
+    ) -> ctx::Result<Transaction> {
         // Check whether we should ignore tx requests.
         if self.skipping_txs {
-            // As per expectation, we should provide a delay given by the state keeper.
-            tokio::time::sleep(max_wait).await;
-            // Return the action to the scenario as we don't use it.
-            self.actions.lock().unwrap().push_front(action);
-            return Ok(None);
+            ctx.canceled().await;
+            return Err(ctx::Canceled.into());
         }
 
+        let action = self.pop_next_item("wait_for_next_tx");
         // We shouldn't, process normally.
         let ScenarioItem::Tx(_, tx, _) = action else {
             panic!("Unexpected action: {:?}", action);
         };
-        Ok(Some(tx))
+        Ok(tx)
     }
 
     async fn rollback(&mut self, tx: Transaction) -> anyhow::Result<()> {
@@ -808,10 +770,10 @@ pub struct MockReadStorageFactory;
 impl ReadStorageFactory<OwnedStorage> for MockReadStorageFactory {
     async fn access_storage(
         &self,
-        _stop_receiver: &watch::Receiver<bool>,
+        _ctx: &ctx::Ctx,
         _l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Option<OwnedStorage>> {
+    ) -> ctx::Result<OwnedStorage> {
         let storage = InMemoryStorage::default();
-        Ok(Some(OwnedStorage::boxed(storage)))
+        Ok(OwnedStorage::boxed(storage))
     }
 }

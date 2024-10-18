@@ -6,6 +6,7 @@ use zksync_dal::{ConnectionPool, Core};
 use zksync_shared_metrics::{SnapshotRecoveryStage, APP_METRICS};
 use zksync_storage::RocksDB;
 use zksync_types::L1BatchNumber;
+use zksync_concurrency::{ctx,error::Wrap as _};
 
 use crate::{RocksdbStorage, RocksdbStorageOptions, StateKeeperColumnFamily};
 
@@ -140,7 +141,7 @@ impl AsyncCatchupTask {
     ///
     /// Propagates RocksDB and Postgres errors.
     #[tracing::instrument(name = "catch_up", skip_all, fields(target_l1_batch = ?self.to_l1_batch_number))]
-    pub async fn run(self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
         let started_at = Instant::now();
         tracing::info!("Catching up RocksDB asynchronously");
 
@@ -152,16 +153,16 @@ impl AsyncCatchupTask {
         .context("Failed creating RocksDB storage builder")?;
 
         let initial_state = InitialRocksdbState {
-            l1_batch_number: rocksdb_builder.l1_batch_number().await,
+            l1_batch_number: rocksdb_builder.l1_batch_number().await.context("l1_batch_number()")?,
         };
         tracing::info!("Initialized RocksDB catchup from state: {initial_state:?}");
         self.initial_state_sender.send_replace(Some(initial_state));
 
-        let mut connection = self.pool.connection_tagged("state_keeper").await?;
+        let mut connection = self.pool.connection_tagged("state_keeper").await.context("connection()")?;
         let was_recovered_from_snapshot = rocksdb_builder
-            .ensure_ready(&mut connection, &stop_receiver)
+            .ensure_ready(ctx, &mut connection)
             .await
-            .context("failed initializing state keeper RocksDB from snapshot or scratch")?;
+            .wrap("failed initializing state keeper RocksDB from snapshot or scratch")?;
         if was_recovered_from_snapshot {
             let elapsed = started_at.elapsed();
             APP_METRICS.snapshot_recovery_latency[&SnapshotRecoveryStage::StateKeeperCache]
@@ -170,15 +171,11 @@ impl AsyncCatchupTask {
         }
 
         let rocksdb = rocksdb_builder
-            .synchronize(&mut connection, &stop_receiver, self.to_l1_batch_number)
+            .synchronize(ctx, &mut connection, self.to_l1_batch_number)
             .await
-            .context("Failed to catch up RocksDB to Postgres")?;
+            .wrap("Failed to catch up RocksDB to Postgres")?;
         drop(connection);
-        if let Some(rocksdb) = rocksdb {
-            self.db_sender.send_replace(Some(rocksdb.into_rocksdb()));
-        } else {
-            tracing::info!("Synchronizing RocksDB interrupted");
-        }
+        self.db_sender.send_replace(Some(rocksdb.into_rocksdb()));
         Ok(())
     }
 }

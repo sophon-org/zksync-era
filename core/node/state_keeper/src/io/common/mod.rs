@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use anyhow::Context;
 use zksync_dal::{Connection, Core, CoreDal};
 use zksync_multivm::interface::{L1BatchEnv, SystemEnv};
@@ -9,15 +7,6 @@ use super::PendingBatchData;
 
 #[cfg(test)]
 mod tests;
-
-/// Returns the amount of iterations `delay_interval` fits into `max_wait`, rounding up.
-pub(crate) fn poll_iters(delay_interval: Duration, max_wait: Duration) -> usize {
-    let max_wait_millis = max_wait.as_millis() as u64;
-    let delay_interval_millis = delay_interval.as_millis() as u64;
-    assert!(delay_interval_millis > 0, "delay interval must be positive");
-
-    ((max_wait_millis + delay_interval_millis - 1) / delay_interval_millis).max(1) as usize
-}
 
 /// Cursor of the L2 block / L1 batch progress used by [`StateKeeperIO`](super::StateKeeperIO) implementations.
 #[derive(Debug)]

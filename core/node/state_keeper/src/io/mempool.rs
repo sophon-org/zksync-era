@@ -2,7 +2,6 @@ use std::{
     cmp,
     collections::HashMap,
     sync::Arc,
-    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
@@ -17,13 +16,14 @@ use zksync_types::{
     block::UnsealedL1BatchHeader, protocol_upgrade::ProtocolUpgradeTx, utils::display_timestamp,
     Address, L1BatchNumber, L2BlockNumber, L2ChainId, ProtocolVersionId, Transaction, H256, U256,
 };
+use zksync_concurrency::{ctx,time};
 // TODO (SMA-1206): use seconds instead of milliseconds.
 use zksync_utils::time::millis_since_epoch;
 use zksync_vm_executor::storage::L1BatchParamsProvider;
 
 use crate::{
     io::{
-        common::{load_pending_batch, poll_iters, IoCursor},
+        common::{load_pending_batch, IoCursor},
         seal_logic::l2_block_seal_subtasks::L2BlockSealProcess,
         L1BatchParams, L2BlockParams, PendingBatchData, StateKeeperIO,
     },
@@ -51,7 +51,7 @@ pub struct MempoolIO {
     fee_account: Address,
     validation_computational_gas_limit: u32,
     max_allowed_tx_gas_limit: U256,
-    delay_interval: Duration,
+    delay_interval: time::Duration,
     // Used to keep track of gas prices to set accepted price per pubdata byte in blocks.
     batch_fee_input_provider: Arc<dyn BatchFeeModelInputProvider>,
     chain_id: L2ChainId,
@@ -154,19 +154,19 @@ impl StateKeeperIO for MempoolIO {
 
     async fn wait_for_new_batch_params(
         &mut self,
+        ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<L1BatchParams>> {
+    ) -> ctx::Result<L1BatchParams> {
         // Check if there is an existing unsealed batch
         if let Some(unsealed_storage_batch) = self
             .pool
             .connection_tagged("state_keeper")
-            .await?
+            .await.context("connection()")?
             .blocks_dal()
             .get_unsealed_l1_batch()
-            .await?
+            .await.context("get_unsealed_l1_batch()")?
         {
-            return Ok(Some(L1BatchParams {
+            return Ok(L1BatchParams {
                 protocol_version: unsealed_storage_batch
                     .protocol_version
                     .expect("unsealed batch is missing protocol version"),
@@ -178,31 +178,23 @@ impl StateKeeperIO for MempoolIO {
                     // This value is effectively ignored by the protocol.
                     virtual_blocks: 1,
                 },
-            }));
+            });
         }
-
-        let deadline = Instant::now() + max_wait;
 
         // Block until at least one transaction in the mempool can match the filter (or timeout happens).
         // This is needed to ensure that block timestamp is not too old.
-        for _ in 0..poll_iters(self.delay_interval, max_wait) {
+        while ctx.is_active() {
             // We cannot create two L1 batches or L2 blocks with the same timestamp (forbidden by the bootloader).
             // Hence, we wait until the current timestamp is larger than the timestamp of the previous L2 block.
             // We can use `timeout_at` since `sleep_past` is cancel-safe; it only uses `sleep()` async calls.
-            let timestamp = tokio::time::timeout_at(
-                deadline.into(),
-                sleep_past(cursor.prev_l2_block_timestamp, cursor.next_l2_block),
-            );
-            let Some(timestamp) = timestamp.await.ok() else {
-                return Ok(None);
-            };
+            let timestamp = sleep_past(ctx,cursor.prev_l2_block_timestamp, cursor.next_l2_block).await?;
 
             tracing::trace!(
                 "Fee input for L1 batch #{} is {:#?}",
                 cursor.l1_batch,
                 self.filter.fee_input
             );
-            let mut storage = self.pool.connection_tagged("state_keeper").await?;
+            let mut storage = self.pool.connection_tagged("state_keeper").await.context("connection()")?;
             let protocol_version = storage
                 .protocol_versions_dal()
                 .protocol_version_id_by_timestamp(timestamp)
@@ -220,13 +212,14 @@ impl StateKeeperIO for MempoolIO {
             .context("failed creating L2 transaction filter")?;
 
             if !self.mempool.has_next(&self.filter) {
-                tokio::time::sleep(self.delay_interval).await;
+                ctx.sleep(self.delay_interval).await?;
                 continue;
             }
 
             self.pool
                 .connection_tagged("state_keeper")
-                .await?
+                .await
+                .context("connection()")?
                 .blocks_dal()
                 .insert_l1_batch(UnsealedL1BatchHeader {
                     number: cursor.l1_batch,
@@ -235,9 +228,9 @@ impl StateKeeperIO for MempoolIO {
                     fee_address: self.fee_account,
                     fee_input: self.filter.fee_input,
                 })
-                .await?;
+                .await.context("insert_l1_batch()")?;
 
-            return Ok(Some(L1BatchParams {
+            return Ok(L1BatchParams {
                 protocol_version,
                 validation_computational_gas_limit: self.validation_computational_gas_limit,
                 operator_address: self.fee_account,
@@ -247,40 +240,30 @@ impl StateKeeperIO for MempoolIO {
                     // This value is effectively ignored by the protocol.
                     virtual_blocks: 1,
                 },
-            }));
+            });
         }
-        Ok(None)
+        Err(ctx::Canceled.into())
     }
 
     async fn wait_for_new_l2_block_params(
         &mut self,
+        ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<L2BlockParams>> {
-        // We must provide different timestamps for each L2 block.
-        // If L2 block sealing interval is greater than 1 second then `sleep_past` won't actually sleep.
-        let timeout_result = tokio::time::timeout(
-            max_wait,
-            sleep_past(cursor.prev_l2_block_timestamp, cursor.next_l2_block),
-        )
-        .await;
-        let Ok(timestamp) = timeout_result else {
-            return Ok(None);
-        };
-
-        Ok(Some(L2BlockParams {
-            timestamp,
+    ) -> ctx::Result<L2BlockParams> {
+        Ok(L2BlockParams {
+            // We must provide different timestamps for each L2 block.
+            // If L2 block sealing interval is greater than 1 second then `sleep_past` won't actually sleep.
+            timestamp: sleep_past(ctx, cursor.prev_l2_block_timestamp, cursor.next_l2_block).await?,
             // This value is effectively ignored by the protocol.
             virtual_blocks: 1,
-        }))
+        })
     }
 
     async fn wait_for_next_tx(
         &mut self,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<Transaction>> {
-        let started_at = Instant::now();
-        while started_at.elapsed() <= max_wait {
+        ctx: &ctx::Ctx,
+    ) -> ctx::Result<Transaction> {
+        loop {
             let get_latency = KEEPER_METRICS.get_tx_from_mempool.start();
             let maybe_tx = self.mempool.next_transaction(&self.filter);
             get_latency.observe();
@@ -298,13 +281,10 @@ impl StateKeeperIO for MempoolIO {
                         .await?;
                     continue;
                 }
-                return Ok(Some(tx));
-            } else {
-                tokio::time::sleep(self.delay_interval).await;
-                continue;
+                return Ok(tx);
             }
+            ctx.sleep(self.delay_interval).await?;
         }
-        Ok(None)
     }
 
     async fn rollback(&mut self, tx: Transaction) -> anyhow::Result<()> {
@@ -409,11 +389,11 @@ impl StateKeeperIO for MempoolIO {
 /// Sleeps until the current timestamp is larger than the provided `timestamp`.
 ///
 /// Returns the current timestamp after the sleep. It is guaranteed to be larger than `timestamp`.
-async fn sleep_past(timestamp: u64, l2_block: L2BlockNumber) -> u64 {
+async fn sleep_past(ctx: &ctx::Ctx, timestamp: u64, l2_block: L2BlockNumber) -> ctx::OrCanceled<u64> {
     let mut current_timestamp_millis = millis_since_epoch();
     let mut current_timestamp = (current_timestamp_millis / 1_000) as u64;
     match timestamp.cmp(&current_timestamp) {
-        cmp::Ordering::Less => return current_timestamp,
+        cmp::Ordering::Less => return Ok(current_timestamp),
         cmp::Ordering::Equal => {
             tracing::info!(
                 "Current timestamp {} for L2 block #{l2_block} is equal to previous L2 block timestamp; waiting until \
@@ -440,15 +420,15 @@ async fn sleep_past(timestamp: u64, l2_block: L2BlockNumber) -> u64 {
         // since we've ensured that `timestamp >= current_timestamp`.
         let wait_seconds = timestamp - current_timestamp;
         // Time to wait until the current timestamp increases.
-        let wait_millis = 1_001 - (current_timestamp_millis % 1_000) as u64;
-        let wait = Duration::from_millis(wait_millis + wait_seconds * 1_000);
+        let wait_millis = 1_001 - (current_timestamp_millis % 1_000) as i64;
+        let wait = time::Duration::milliseconds(wait_millis + (wait_seconds as i64) * 1_000);
 
-        tokio::time::sleep(wait).await;
+        ctx.sleep(wait).await?;
         current_timestamp_millis = millis_since_epoch();
         current_timestamp = (current_timestamp_millis / 1_000) as u64;
 
         if current_timestamp > timestamp {
-            return current_timestamp;
+            return Ok(current_timestamp);
         }
     }
 }
@@ -460,7 +440,7 @@ impl MempoolIO {
         pool: ConnectionPool<Core>,
         config: &StateKeeperConfig,
         fee_account: Address,
-        delay_interval: Duration,
+        delay_interval: time::Duration,
         chain_id: L2ChainId,
     ) -> anyhow::Result<Self> {
         Ok(Self {
@@ -491,50 +471,32 @@ impl MempoolIO {
 
 #[cfg(test)]
 mod tests {
-    use tokio::time::timeout_at;
     use zksync_utils::time::seconds_since_epoch;
-
+    use zksync_concurrency::testonly::abort_on_panic;
     use super::*;
 
     // This test defensively uses large deadlines in order to account for tests running in parallel etc.
     #[tokio::test]
     async fn sleeping_past_timestamp() {
+        abort_on_panic();
+        let ctx = &ctx::test_root(&ctx::RealClock);
         let past_timestamps = [0, 1_000, 1_000_000_000, seconds_since_epoch() - 10];
         for timestamp in past_timestamps {
-            let deadline = Instant::now() + Duration::from_secs(1);
-            timeout_at(deadline.into(), sleep_past(timestamp, L2BlockNumber(1)))
-                .await
-                .unwrap();
+            sleep_past(ctx, timestamp, L2BlockNumber(1)).await.unwrap();
         }
 
         let current_timestamp = seconds_since_epoch();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let ts = timeout_at(
-            deadline.into(),
-            sleep_past(current_timestamp, L2BlockNumber(1)),
-        )
-        .await
-        .unwrap();
+        let ts = sleep_past(ctx, current_timestamp, L2BlockNumber(1)).await.unwrap();
         assert!(ts > current_timestamp);
 
         let future_timestamp = seconds_since_epoch() + 1;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let ts = timeout_at(
-            deadline.into(),
-            sleep_past(future_timestamp, L2BlockNumber(1)),
-        )
-        .await
-        .unwrap();
+        let ts = sleep_past(ctx, future_timestamp, L2BlockNumber(1)).await.unwrap();
         assert!(ts > future_timestamp);
 
         let future_timestamp = seconds_since_epoch() + 1;
-        let deadline = Instant::now() + Duration::from_millis(100);
+        let ctx = &ctx.with_timeout(time::Duration::milliseconds(100));
         // ^ This deadline is too small (we need at least 1_000ms)
-        let result = timeout_at(
-            deadline.into(),
-            sleep_past(future_timestamp, L2BlockNumber(1)),
-        )
-        .await;
+        let result = sleep_past(ctx, future_timestamp, L2BlockNumber(1)).await;
         assert!(result.is_err());
     }
 }

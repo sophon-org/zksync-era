@@ -6,6 +6,7 @@ use std::{
     time::Instant,
 };
 
+use zksync_concurrency::{ctx,testonly::abort_on_panic};
 use tokio::sync::watch;
 use zksync_config::configs::chain::StateKeeperConfig;
 use zksync_multivm::{
@@ -28,7 +29,6 @@ use zksync_utils::u256_to_h256;
 
 use crate::{
     io::PendingBatchData,
-    keeper::POLL_WAIT_DURATION,
     seal_criteria::{
         criteria::{GasCriterion, SlotsCriterion},
         SequencerSealer, UnexecutableReason,
@@ -174,6 +174,8 @@ impl Query {
 
 #[tokio::test]
 async fn sealed_by_number_of_txs() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -187,7 +189,7 @@ async fn sealed_by_number_of_txs() {
         .next_tx("Second tx", random_tx(2), successful_exec())
         .l2_block_sealed("L2 block 2")
         .batch_sealed("Batch 1")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
@@ -466,7 +468,8 @@ async fn unconditional_sealing() {
     let batch_seal_trigger = Arc::new(AtomicBool::new(false));
     let batch_seal_trigger_checker = batch_seal_trigger.clone();
     let start = Instant::now();
-    let seal_l2_block_after = POLL_WAIT_DURATION; // Seal after 2 state keeper polling duration intervals.
+    //TODO
+    let seal_l2_block_after = std::time::Duration::secs(1); // Seal after 2 state keeper polling duration intervals.
 
     let config = StateKeeperConfig {
         transaction_slots: 2,

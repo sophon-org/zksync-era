@@ -1,5 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap};
 
+use zksync_concurrency::{ctx,testonly::abort_on_panic};
 use test_casing::test_casing;
 use zksync_contracts::BaseSystemContractsHashes;
 use zksync_dal::{ConnectionPool, Core, CoreDal};
@@ -99,6 +100,8 @@ async fn test_filter_with_pending_batch(commitment_mode: L1BatchCommitmentMode) 
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn test_filter_with_no_pending_batch(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
     tester.genesis(&connection_pool).await;
@@ -135,13 +138,14 @@ async fn test_filter_with_no_pending_batch(commitment_mode: L1BatchCommitmentMod
     // Now, given that there is a transaction matching the expected filter, waiting for the new batch params
     // should succeed and initialize the filter.
     mempool
-        .wait_for_new_batch_params(&io_cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx, &io_cursor)
         .await
         .expect("No batch params in the test mempool");
     assert_eq!(mempool.filter(), &want_filter);
 }
 
 async fn test_timestamps_are_distinct(
+    ctx: &ctx::Ctx,
     connection_pool: ConnectionPool<Core>,
     prev_l2_block_timestamp: u64,
     delay_prev_l2_block_compared_to_batch: bool,
@@ -172,38 +176,43 @@ async fn test_timestamps_are_distinct(
     tester.insert_tx(&mut guard, tx_filter.fee_per_gas, tx_filter.gas_per_pubdata);
 
     let l1_batch_params = mempool
-        .wait_for_new_batch_params(&io_cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx, &io_cursor)
         .await
-        .unwrap()
-        .expect("No batch params in the test mempool");
+        .unwrap();
     assert!(l1_batch_params.first_l2_block.timestamp > prev_l2_block_timestamp);
 }
 
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn l1_batch_timestamp_basics(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
     let current_timestamp = seconds_since_epoch();
-    test_timestamps_are_distinct(connection_pool, current_timestamp, false, tester).await;
+    test_timestamps_are_distinct(ctx, connection_pool, current_timestamp, false, tester).await;
 }
 
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn l1_batch_timestamp_with_clock_skew(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
     let current_timestamp = seconds_since_epoch();
-    test_timestamps_are_distinct(connection_pool, current_timestamp + 2, false, tester).await;
+    test_timestamps_are_distinct(ctx, connection_pool, current_timestamp + 2, false, tester).await;
 }
 
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn l1_batch_timestamp_respects_prev_l2_block(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
     let current_timestamp = seconds_since_epoch();
-    test_timestamps_are_distinct(connection_pool, current_timestamp, true, tester).await;
+    test_timestamps_are_distinct(ctx, connection_pool, current_timestamp, true, tester).await;
 }
 
 #[test_casing(2, COMMITMENT_MODES)]
@@ -211,10 +220,12 @@ async fn l1_batch_timestamp_respects_prev_l2_block(commitment_mode: L1BatchCommi
 async fn l1_batch_timestamp_respects_prev_l2_block_with_clock_skew(
     commitment_mode: L1BatchCommitmentMode,
 ) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
     let current_timestamp = seconds_since_epoch();
-    test_timestamps_are_distinct(connection_pool, current_timestamp + 2, true, tester).await;
+    test_timestamps_are_distinct(ctx, connection_pool, current_timestamp + 2, true, tester).await;
 }
 
 #[tokio::test]
@@ -405,6 +416,8 @@ async fn processing_events_when_sealing_l2_block() {
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn l2_block_processing_after_snapshot_recovery(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::test_pool().await;
     let tester = Tester::new(commitment_mode);
     let mut storage = connection_pool.connection().await.unwrap();
@@ -443,10 +456,9 @@ async fn l2_block_processing_after_snapshot_recovery(commitment_mode: L1BatchCom
     assert_eq!(previous_batch_hash, snapshot_recovery.l1_batch_root_hash);
 
     let l1_batch_params = mempool
-        .wait_for_new_batch_params(&cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx, &cursor)
         .await
-        .unwrap()
-        .expect("no batch params generated");
+        .unwrap();
     let (system_env, l1_batch_env) = l1_batch_params.into_env(
         L2ChainId::default(),
         BASE_SYSTEM_CONTRACTS.clone(),
@@ -539,6 +551,9 @@ async fn l2_block_processing_after_snapshot_recovery(commitment_mode: L1BatchCom
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn different_timestamp_for_l2_blocks_in_same_batch(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
+
     let connection_pool = ConnectionPool::<Core>::constrained_test_pool(1).await;
     let tester = Tester::new(commitment_mode);
 
@@ -550,16 +565,17 @@ async fn different_timestamp_for_l2_blocks_in_same_batch(commitment_mode: L1Batc
     io_cursor.prev_l2_block_timestamp = current_timestamp;
 
     let l2_block_params = mempool
-        .wait_for_new_l2_block_params(&io_cursor, Duration::from_secs(10))
+        .wait_for_new_l2_block_params(ctx, &io_cursor)
         .await
-        .unwrap()
-        .expect("no new L2 block params");
+        .unwrap();
     assert!(l2_block_params.timestamp > current_timestamp);
 }
 
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn continue_unsealed_batch_on_restart(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::test_pool().await;
     let tester = Tester::new(commitment_mode);
     tester.genesis(&connection_pool).await;
@@ -588,10 +604,9 @@ async fn continue_unsealed_batch_on_restart(commitment_mode: L1BatchCommitmentMo
         .unwrap();
 
     let old_l1_batch_params = mempool
-        .wait_for_new_batch_params(&cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx, &cursor)
         .await
-        .unwrap()
-        .expect("no batch params generated");
+        .unwrap();
 
     // Restart
     drop((mempool, mempool_guard, cursor));
@@ -599,10 +614,9 @@ async fn continue_unsealed_batch_on_restart(commitment_mode: L1BatchCommitmentMo
     let (cursor, _) = mempool.initialize().await.unwrap();
 
     let new_l1_batch_params = mempool
-        .wait_for_new_batch_params(&cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx, &cursor)
         .await
-        .unwrap()
-        .expect("no batch params generated");
+        .unwrap();
 
     assert_eq!(old_l1_batch_params, new_l1_batch_params);
 }
@@ -610,6 +624,8 @@ async fn continue_unsealed_batch_on_restart(commitment_mode: L1BatchCommitmentMo
 #[test_casing(2, COMMITMENT_MODES)]
 #[tokio::test]
 async fn insert_unsealed_batch_on_init(commitment_mode: L1BatchCommitmentMode) {
+    abort_on_panic();   
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::test_pool().await;
     let mut tester = Tester::new(commitment_mode);
     tester.genesis(&connection_pool).await;
@@ -633,10 +649,9 @@ async fn insert_unsealed_batch_on_init(commitment_mode: L1BatchCommitmentMode) {
 
     // Make sure we are able to fetch the newly inserted batch's params
     let l1_batch_params = mempool
-        .wait_for_new_batch_params(&cursor, Duration::from_secs(10))
+        .wait_for_new_batch_params(ctx,&cursor)
         .await
-        .unwrap()
-        .expect("no batch params generated");
+        .unwrap();
     assert_eq!(l1_batch_params.fee_input, fee_input);
     assert_eq!(l1_batch_params.first_l2_block.timestamp, 2);
 }

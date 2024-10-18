@@ -20,7 +20,7 @@ pub use self::{
     },
     shadow_storage::ShadowStorage,
     storage_factory::{
-        BatchDiff, CommonStorage, OwnedStorage, ReadStorageFactory, RocksdbWithMemory,
+        BatchDiff, CommonStorage, OwnedStorage, RocksdbWithMemory,
         SnapshotStorage,
     },
 };

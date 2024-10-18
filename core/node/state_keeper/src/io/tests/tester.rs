@@ -1,7 +1,8 @@
 //! Testing harness for the IO.
 
-use std::{slice, sync::Arc, time::Duration};
+use std::{slice, sync::Arc};
 
+use zksync_concurrency::time;
 use zksync_base_token_adjuster::NoOpRatioProvider;
 use zksync_config::{
     configs::{chain::StateKeeperConfig, eth_sender::PubdataSendingMode, wallets::Wallets},
@@ -144,7 +145,7 @@ impl Tester {
             pool,
             &config,
             wallets.state_keeper.unwrap().fee_account.address(),
-            Duration::from_secs(1),
+            time::Duration::seconds(1),
             L2ChainId::from(270),
         )
         .unwrap();

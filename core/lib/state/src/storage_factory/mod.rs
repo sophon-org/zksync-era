@@ -1,13 +1,13 @@
-use std::{collections::HashSet, fmt};
+use std::{collections::HashSet};
 
 use anyhow::Context as _;
-use async_trait::async_trait;
-use tokio::{runtime::Handle, sync::watch};
-use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
+use tokio::{runtime::Handle};
+use zksync_dal::{Connection, Core, CoreDal};
 use zksync_storage::RocksDB;
 use zksync_types::{L1BatchNumber, StorageKey, StorageValue, H256};
 use zksync_utils::u256_to_h256;
 use zksync_vm_interface::storage::{ReadStorage, StorageSnapshot};
+use zksync_concurrency::{ctx,error::Wrap as _};
 
 use self::metrics::{SnapshotStage, SNAPSHOT_METRICS};
 pub use self::{
@@ -90,34 +90,31 @@ impl CommonStorage<'static> {
     ///
     /// Propagates RocksDB and Postgres errors.
     pub async fn rocksdb(
+        ctx: &ctx::Ctx,
         connection: &mut Connection<'_, Core>,
         rocksdb: RocksDB<StateKeeperColumnFamily>,
-        stop_receiver: &watch::Receiver<bool>,
         l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Option<Self>> {
+    ) -> ctx::Result<Self> {
         tracing::debug!("Catching up RocksDB synchronously");
         let rocksdb_builder = RocksdbStorageBuilder::from_rocksdb(rocksdb);
         let rocksdb = rocksdb_builder
-            .synchronize(connection, stop_receiver, None)
+            .synchronize(ctx, connection, None)
             .await
-            .context("Failed to catch up state keeper RocksDB storage to Postgres")?;
-        let Some(rocksdb) = rocksdb else {
-            tracing::info!("Synchronizing RocksDB interrupted");
-            return Ok(None);
-        };
+            .wrap("Failed to catch up state keeper RocksDB storage to Postgres")?;
         let rocksdb_l1_batch_number = rocksdb
             .l1_batch_number()
             .await
-            .ok_or_else(|| anyhow::anyhow!("No L1 batches available in Postgres"))?;
+            .context("l1_batch_number()")?
+            .context("No L1 batches available in Postgres")?;
         if l1_batch_number + 1 != rocksdb_l1_batch_number {
-            anyhow::bail!(
+            return Err(anyhow::format_err!(
                 "RocksDB synchronized to L1 batch #{} while #{} was expected",
                 rocksdb_l1_batch_number,
                 l1_batch_number
-            );
+            ).into());
         }
         tracing::debug!(%rocksdb_l1_batch_number, "Using RocksDB-based storage");
-        Ok(Some(rocksdb.into()))
+        Ok(rocksdb.into())
     }
 
     /// Creates a storage snapshot. Require protective reads to be persisted for the batch, otherwise
@@ -286,34 +283,3 @@ impl<'a> From<SnapshotStorage<'a>> for CommonStorage<'a> {
 
 /// Storage with a static lifetime that can be sent to Tokio tasks etc.
 pub type OwnedStorage = CommonStorage<'static>;
-
-/// Factory that can produce storage instances on demand. The storage type is encapsulated as a type param
-/// (mostly for testing purposes); the default is [`OwnedStorage`].
-#[async_trait]
-pub trait ReadStorageFactory<S = OwnedStorage>: fmt::Debug + Send + Sync + 'static {
-    /// Creates a storage instance, e.g. over a Postgres connection or a RocksDB instance.
-    /// The specific criteria on which one are left up to the implementation.
-    ///
-    /// Implementations may be cancel-aware and return `Ok(None)` iff `stop_receiver` receives
-    /// a stop signal; this is the only case in which `Ok(None)` should be returned.
-    async fn access_storage(
-        &self,
-        stop_receiver: &watch::Receiver<bool>,
-        l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Option<S>>;
-}
-
-/// [`ReadStorageFactory`] producing Postgres-backed storage instances. Hence, it is slower than more advanced
-/// alternatives with RocksDB caches and should be used sparingly (e.g., for testing).
-#[async_trait]
-impl ReadStorageFactory for ConnectionPool<Core> {
-    async fn access_storage(
-        &self,
-        _stop_receiver: &watch::Receiver<bool>,
-        l1_batch_number: L1BatchNumber,
-    ) -> anyhow::Result<Option<OwnedStorage>> {
-        let connection = self.connection().await?;
-        let storage = OwnedStorage::postgres(connection, l1_batch_number).await?;
-        Ok(Some(storage.into()))
-    }
-}
