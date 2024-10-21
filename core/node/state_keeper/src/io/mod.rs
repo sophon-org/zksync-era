@@ -132,7 +132,7 @@ pub trait StateKeeperIO: 'static + Send + Sync + fmt::Debug + IoSealCriteria {
 
     /// Blocks for up to `max_wait` until the next transaction is available for execution.
     /// Returns `None` if no transaction became available until the timeout.
-    async fn wait_for_next_tx(&mut self, ctx: &ctx::Ctx) -> ctx::Result<Transaction>;
+    async fn wait_for_next_tx(&mut self, ctx: &ctx::Ctx) -> ctx::Result<Option<Transaction>>;
     /// Marks the transaction as "not executed", so it can be retrieved from the IO again.
     async fn rollback(&mut self, tx: Transaction) -> anyhow::Result<()>;
     /// Marks the transaction as "rejected", e.g. one that is not correct and can't be executed.

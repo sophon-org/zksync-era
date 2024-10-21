@@ -7,7 +7,6 @@ use std::{
 };
 
 use zksync_concurrency::{ctx,testonly::abort_on_panic};
-use tokio::sync::watch;
 use zksync_config::configs::chain::StateKeeperConfig;
 use zksync_multivm::{
     interface::{
@@ -195,6 +194,9 @@ async fn sealed_by_number_of_txs() {
 
 #[tokio::test]
 async fn sealed_by_gas() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
+    
     let first_tx = random_tx(1);
     let execution_result = successful_exec_with_log();
     let exec_metrics = execution_result
@@ -237,11 +239,13 @@ async fn sealed_by_gas() {
                 "L1 gas used by a batch should consist of gas used by its txs + basic block gas cost"
             );
         })
-        .run(sealer).await;
+        .run(ctx,sealer).await;
 }
 
 #[tokio::test]
 async fn sealed_by_gas_then_by_num_tx() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         max_single_tx_gas: 62_000,
         reject_tx_at_gas_percentage: 1.0,
@@ -269,12 +273,14 @@ async fn sealed_by_gas_then_by_num_tx() {
         .next_tx("Fourth tx", random_tx(4), successful_exec())
         .l2_block_sealed("L2 block 4")
         .batch_sealed("Batch 2")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 #[tokio::test]
 async fn batch_sealed_before_l2_block_does() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -294,12 +300,14 @@ async fn batch_sealed_before_l2_block_does() {
             );
         })
         .batch_sealed("Batch 1")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 #[tokio::test]
 async fn rejected_tx() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -324,12 +332,14 @@ async fn rejected_tx() {
         .next_tx("Second successful tx", random_tx(3), successful_exec())
         .l2_block_sealed("Second L2 block")
         .batch_sealed("Batch with 2 successful txs")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 #[tokio::test]
 async fn bootloader_tip_out_of_gas_flow() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -362,12 +372,14 @@ async fn bootloader_tip_out_of_gas_flow() {
         .next_tx("Second tx of the 2nd batch", third_tx, successful_exec())
         .l2_block_sealed("L2 block with 2nd tx")
         .batch_sealed("2nd batch sealed")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 #[tokio::test]
 async fn pending_batch_is_applied() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 3,
         ..StateKeeperConfig::default()
@@ -412,7 +424,7 @@ async fn pending_batch_is_applied() {
                 "There should be 3 transactions in the batch"
             );
         })
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
@@ -422,20 +434,18 @@ async fn load_upgrade_tx() {
     let sealer = SequencerSealer::default();
     let scenario = TestScenario::new();
     let batch_executor = TestBatchExecutorBuilder::new(&scenario);
-    let (stop_sender, stop_receiver) = watch::channel(false);
 
-    let (mut io, output_handler) = TestIO::new(stop_sender, scenario);
+    let (mut io, output_handler) = TestIO::new(scenario);
     io.add_upgrade_tx(ProtocolVersionId::latest(), random_upgrade_tx(1));
     io.add_upgrade_tx(ProtocolVersionId::next(), random_upgrade_tx(2));
 
-    let mut sk = ZkSyncStateKeeper::new(
-        stop_receiver,
-        Box::new(io),
-        Box::new(batch_executor),
+    let mut sk = ZkSyncStateKeeper {
+        io: Box::new(io),
+        batch_executor: Box::new(batch_executor),
         output_handler,
-        Arc::new(sealer),
-        Arc::new(MockReadStorageFactory),
-    );
+        sealer: Arc::new(sealer),
+        storage_factory: Arc::new(MockReadStorageFactory),
+    };
 
     // Since the version hasn't changed, and we are not using shared bridge, we should not load any
     // upgrade transactions.
@@ -463,13 +473,15 @@ async fn load_upgrade_tx() {
 /// TODO(PLA-881): this test can be flaky if run under load.
 #[tokio::test]
 async fn unconditional_sealing() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     // Trigger to know when to seal the batch.
     // Once L2 block with one tx would be sealed, trigger would allow batch to be sealed as well.
     let batch_seal_trigger = Arc::new(AtomicBool::new(false));
     let batch_seal_trigger_checker = batch_seal_trigger.clone();
     let start = Instant::now();
     //TODO
-    let seal_l2_block_after = std::time::Duration::secs(1); // Seal after 2 state keeper polling duration intervals.
+    let seal_l2_block_after = std::time::Duration::from_secs(1); // Seal after 2 state keeper polling duration intervals.
 
     let config = StateKeeperConfig {
         transaction_slots: 2,
@@ -494,13 +506,15 @@ async fn unconditional_sealing() {
         .l2_block_sealed("L2 block is sealed with just one tx")
         .no_txs_until_next_action("Still no tx")
         .batch_sealed("Batch is sealed with just one tx")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 /// Checks the next L2 block sealed after pending batch has a correct timestamp
 #[tokio::test]
 async fn l2_block_timestamp_after_pending_batch() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -531,7 +545,7 @@ async fn l2_block_timestamp_after_pending_batch() {
             );
         })
         .batch_sealed("Batch is sealed with two transactions")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
@@ -541,6 +555,8 @@ async fn l2_block_timestamp_after_pending_batch() {
 /// any unexpected value on its own.
 #[tokio::test]
 async fn time_is_monotonic() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let timestamp_first_l2_block = Arc::new(AtomicU64::new(0u64)); // Time is faked in tests.
     let timestamp_second_l2_block = timestamp_first_l2_block.clone();
     let timestamp_third_l2_block = timestamp_first_l2_block.clone();
@@ -590,12 +606,14 @@ async fn time_is_monotonic() {
             );
             timestamp_third_l2_block.store(updates.l2_block.timestamp, Ordering::Relaxed);
         })
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }
 
 #[tokio::test]
 async fn protocol_upgrade() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let config = StateKeeperConfig {
         transaction_slots: 2,
         ..StateKeeperConfig::default()
@@ -627,6 +645,6 @@ async fn protocol_upgrade() {
         .next_tx("Fourth tx", random_tx(4), successful_exec())
         .l2_block_sealed("L2 block 4")
         .batch_sealed("Batch 2")
-        .run(sealer)
+        .run(ctx, sealer)
         .await;
 }

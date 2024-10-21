@@ -5,6 +5,7 @@ use zksync_node_genesis::{insert_genesis_batch, GenesisParams};
 use zksync_state::OwnedStorage;
 use zksync_types::{L2ChainId, StorageLogWithPreviousValue};
 use zksync_vm_executor::batch::MainBatchExecutorFactory;
+use zksync_concurrency::{ctx,scope,testonly::abort_on_panic};
 
 use super::*;
 use crate::{
@@ -160,7 +161,7 @@ impl OutputHandlerFactory for StorageWriterIo {
 
 /// Writes missing storage logs into Postgres by executing all transactions from it. Useful both for testing `VmRunner`,
 /// and to fill the storage for multi-batch tests for other components.
-pub(super) async fn write_storage_logs(pool: ConnectionPool<Core>, insert_protective_reads: bool) {
+pub(super) async fn write_storage_logs(ctx: &ctx::Ctx, pool: ConnectionPool<Core>, insert_protective_reads: bool) {
     let mut conn = pool.connection().await.unwrap();
     let sealed_batch = conn
         .blocks_dal()
@@ -183,20 +184,20 @@ pub(super) async fn write_storage_logs(pool: ConnectionPool<Core>, insert_protec
     let loader = Arc::new(loader);
     let batch_executor = MainBatchExecutorFactory::<()>::new(false);
     let vm_runner = VmRunner::new(pool, io.clone(), loader, io, Box::new(batch_executor));
-    let (stop_sender, stop_receiver) = watch::channel(false);
-    let vm_runner_handle = tokio::spawn(async move { vm_runner.run(&stop_receiver).await });
-
-    processed_batch
-        .wait_for(|&number| number >= sealed_batch)
-        .await
-        .unwrap();
-    stop_sender.send_replace(true);
-    vm_runner_handle.await.unwrap().unwrap();
+    scope::run!(ctx, |ctx,s| async {
+        s.spawn_bg(vm_runner.run(ctx));
+        processed_batch
+            .wait_for(|&number| number >= sealed_batch)
+            .await.unwrap();
+        Ok(())
+    }).await.unwrap();
 }
 
 #[test_casing(2, [false, true])]
 #[tokio::test]
 async fn storage_writer_works(insert_protective_reads: bool) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     let genesis_params = GenesisParams::mock();
@@ -211,10 +212,9 @@ async fn storage_writer_works(insert_protective_reads: bool) {
         .unwrap();
     drop(conn);
 
-    write_storage_logs(pool.clone(), insert_protective_reads).await;
+    write_storage_logs(ctx, pool.clone(), insert_protective_reads).await;
 
     // Re-run the VM on all batches to check that storage logs are persisted correctly
-    let (stop_sender, stop_receiver) = watch::channel(false);
     let io = Arc::new(RwLock::new(IoMock {
         current: L1BatchNumber(0),
         max: 5,
@@ -236,23 +236,22 @@ async fn storage_writer_works(insert_protective_reads: bool) {
         assert_matches!(batch_storage, OwnedStorage::Postgres(_));
     }
 
-    let (output_factory, output_factory_task) =
-        ConcurrentOutputHandlerFactory::new(pool.clone(), io.clone(), TestOutputFactory::default());
-    let output_factory_handle = tokio::spawn(output_factory_task.run(stop_receiver.clone()));
-    let batch_executor = MainBatchExecutorFactory::<()>::new(false);
-    let vm_runner = VmRunner::new(
-        pool,
-        io.clone(),
-        loader,
-        Arc::new(output_factory),
-        Box::new(batch_executor),
-    );
-
-    let vm_runner_handle = tokio::spawn(async move { vm_runner.run(&stop_receiver).await });
-    wait::for_batch_progressively(io, L1BatchNumber(5), TEST_TIMEOUT)
-        .await
-        .unwrap();
-    stop_sender.send_replace(true);
-    output_factory_handle.await.unwrap().unwrap();
-    vm_runner_handle.await.unwrap().unwrap();
+    scope::run!(ctx, |ctx,s| async {    
+        let (output_factory, task) =
+            ConcurrentOutputHandlerFactory::new(pool.clone(), io.clone(), TestOutputFactory::default());
+        s.spawn_bg(task.run(ctx));
+        let batch_executor = MainBatchExecutorFactory::<()>::new(false);
+        let vm_runner = VmRunner::new(
+            pool,
+            io.clone(),
+            loader,
+            Arc::new(output_factory),
+            Box::new(batch_executor),
+        );
+        s.spawn_bg(vm_runner.run(ctx));
+        wait::for_batch_progressively(io, L1BatchNumber(5), TEST_TIMEOUT)
+            .await
+            .unwrap();
+        Ok(())
+    }).await.unwrap();
 }

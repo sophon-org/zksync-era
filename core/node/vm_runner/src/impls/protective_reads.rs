@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::watch;
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_types::{L1BatchNumber, L2ChainId, StorageLog};
 use zksync_vm_executor::batch::MainBatchExecutorFactory;
 use zksync_vm_interface::{L1BatchEnv, L2BlockEnv, SystemEnv};
+use zksync_concurrency::ctx;
 
 use crate::{
     storage::StorageSyncTask, ConcurrentOutputHandlerFactory, ConcurrentOutputHandlerFactoryTask,
@@ -61,8 +61,8 @@ impl ProtectiveReadsWriter {
     /// # Errors
     ///
     /// Propagates RocksDB and Postgres errors.
-    pub async fn run(self, stop_receiver: &watch::Receiver<bool>) -> anyhow::Result<()> {
-        self.vm_runner.run(stop_receiver).await
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
+        self.vm_runner.run(ctx).await
     }
 }
 

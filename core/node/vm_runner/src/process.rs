@@ -1,17 +1,17 @@
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Instant},
 };
 
 use anyhow::Context;
 use tokio::{
-    sync::{watch, Mutex},
-    task::JoinHandle,
+    sync::{Mutex},
 };
 use zksync_dal::{ConnectionPool, Core};
 use zksync_state::OwnedStorage;
 use zksync_types::L1BatchNumber;
 use zksync_vm_interface::{executor::BatchExecutorFactory, L2BlockEnv};
+use zksync_concurrency::{ctx, time, scope};
 
 use crate::{
     metrics::{StorageKind, METRICS},
@@ -19,7 +19,7 @@ use crate::{
     L1BatchOutput, L2BlockOutput, OutputHandlerFactory, VmRunnerIo,
 };
 
-const SLEEP_INTERVAL: Duration = Duration::from_millis(50);
+const SLEEP_INTERVAL: time::Duration = time::Duration::milliseconds(50);
 
 /// VM runner represents a logic layer of L1 batch / L2 block processing flow akin to that of state
 /// keeper. The difference is that VM runner is designed to be run on batches/blocks that have
@@ -64,14 +64,14 @@ impl VmRunner {
         }
     }
 
-    async fn process_batch(self, number: L1BatchNumber) -> anyhow::Result<()> {
+    async fn process_batch(&self, ctx: &ctx::Ctx, number: L1BatchNumber) -> ctx::Result<()> {
         let stage_started_at = Instant::now();
         let (batch_data, storage) = loop {
             match self.loader.load_batch(number).await? {
                 Some(data_and_storage) => break data_and_storage,
                 None => {
                     // Next batch has not been loaded yet
-                    tokio::time::sleep(SLEEP_INTERVAL).await;
+                    ctx.sleep(SLEEP_INTERVAL).await?;
                 }
             }
         };
@@ -89,7 +89,7 @@ impl VmRunner {
             .await?;
         self.io
             .mark_l1_batch_as_processing(
-                &mut self.pool.connection_tagged("vm_runner").await?,
+                &mut self.pool.connection_tagged("vm_runner").await.context("connection()")?,
                 number,
             )
             .await?;
@@ -113,10 +113,9 @@ impl VmRunner {
                     .execute_tx(tx.clone())
                     .await
                     .with_context(|| format!("failed executing transaction {:?}", tx.hash()))?;
-                anyhow::ensure!(
-                    !exec_result.was_halted(),
-                    "Unexpected non-successful transaction"
-                );
+                if exec_result.was_halted() {
+                    return Err(anyhow::format_err!("Unexpected non-successful transaction").into());
+                }
                 block_output.push(tx, exec_result);
             }
             output_handler
@@ -143,51 +142,34 @@ impl VmRunner {
 
     /// Consumes VM runner to execute a loop that continuously pulls data from [`VmRunnerIo`] and
     /// processes it.
-    pub async fn run(self, stop_receiver: &watch::Receiver<bool>) -> anyhow::Result<()> {
-        // Join handles for asynchronous tasks that are being run in the background
-        let mut task_handles: Vec<(L1BatchNumber, JoinHandle<anyhow::Result<()>>)> = Vec::new();
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
         let mut next_batch = self
             .io
-            .latest_processed_batch(&mut self.pool.connection_tagged("vm_runner").await?)
+            .latest_processed_batch(&mut self.pool.connection_tagged("vm_runner").await.context("connection()")?)
             .await?
             + 1;
-        loop {
-            if *stop_receiver.borrow() {
-                tracing::info!("VM runner was interrupted");
-                return Ok(());
-            }
-
-            // Traverse all handles and filter out tasks that have been finished. Also propagates
-            // any panic/error that might have happened during the task's execution.
-            let mut retained_handles = Vec::new();
-            for (l1_batch_number, handle) in task_handles {
-                if handle.is_finished() {
-                    handle
-                        .await
-                        .with_context(|| format!("Processing batch #{} panicked", l1_batch_number))?
-                        .with_context(|| format!("Failed to process batch #{}", l1_batch_number))?;
-                } else {
-                    retained_handles.push((l1_batch_number, handle));
+        scope::run!(ctx, |ctx,s| async {
+            while ctx.is_active() {
+                let last_ready_batch = self
+                    .io
+                    .last_ready_to_be_loaded_batch(&mut self.pool.connection_tagged("vm_runner").await.context("connection()")?)
+                    .await?;
+                METRICS.last_ready_batch.set(last_ready_batch.0.into());
+                if next_batch > last_ready_batch {
+                    // Next batch is not ready to be processed yet
+                    ctx.sleep(SLEEP_INTERVAL).await?;
+                    continue;
                 }
+                let l1_batch_number = ctx::NoCopy(next_batch);
+                next_batch += 1;
+                s.spawn(async {
+                    let _guard = METRICS.in_progress_l1_batches.inc_guard(1);
+                    self.process_batch(ctx, *l1_batch_number).await
+                        .with_context(|| format!("Failed to process batch #{}", l1_batch_number.into()))?;
+                    Ok(())
+                });
             }
-            task_handles = retained_handles;
-            METRICS
-                .in_progress_l1_batches
-                .set(task_handles.len() as u64);
-
-            let last_ready_batch = self
-                .io
-                .last_ready_to_be_loaded_batch(&mut self.pool.connection_tagged("vm_runner").await?)
-                .await?;
-            METRICS.last_ready_batch.set(last_ready_batch.0.into());
-            if next_batch > last_ready_batch {
-                // Next batch is not ready to be processed yet
-                tokio::time::sleep(SLEEP_INTERVAL).await;
-                continue;
-            }
-            let handle = tokio::spawn(self.clone().process_batch(next_batch));
-            task_handles.push((next_batch, handle));
-            next_batch += 1;
-        }
+            Err(ctx::Canceled.into())
+        }).await
     }
 }

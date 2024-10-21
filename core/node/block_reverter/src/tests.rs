@@ -2,10 +2,10 @@
 
 use std::{collections::HashSet, sync::Mutex};
 
+use zksync_concurrency::{ctx,testonly::abort_on_panic};
 use assert_matches::assert_matches;
 use async_trait::async_trait;
 use test_casing::test_casing;
-use tokio::sync::watch;
 use zksync_dal::Connection;
 use zksync_merkle_tree::TreeInstruction;
 use zksync_object_store::{Bucket, MockObjectStore};
@@ -116,6 +116,8 @@ async fn setup_storage(storage: &mut Connection<'_, Core>, storage_logs: &[Stora
 #[test_casing(2, [false, true])]
 #[tokio::test]
 async fn block_reverter_basics(sync_merkle_tree: bool) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let storage_logs = gen_storage_logs();
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut storage = pool.connection().await.unwrap();
@@ -139,9 +141,8 @@ async fn block_reverter_basics(sync_merkle_tree: bool) {
 
     let sk_cache_path = temp_dir.path().join("sk_cache");
     let sk_cache = RocksdbStorage::builder(&sk_cache_path).await.unwrap();
-    let (_stop_sender, stop_receiver) = watch::channel(false);
     sk_cache
-        .synchronize(&mut storage, &stop_receiver, None)
+        .synchronize(ctx, &mut storage, None)
         .await
         .unwrap();
 
@@ -193,9 +194,8 @@ async fn block_reverter_basics(sync_merkle_tree: bool) {
 
     let sk_cache = RocksdbStorage::builder(&sk_cache_path).await.unwrap();
     let mut sk_cache = sk_cache
-        .synchronize(&mut storage, &stop_receiver, None)
+        .synchronize(ctx, &mut storage, None)
         .await
-        .unwrap()
         .expect("sk_cache syncing unexpectedly stopped");
     for (i, log) in storage_logs.iter().enumerate() {
         let expected_value = if i <= 5 { log.value } else { H256::zero() };

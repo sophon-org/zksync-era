@@ -42,12 +42,13 @@ impl SyncState {
         self.0.borrow().local_block.unwrap_or_default()
     }
 
-    pub async fn wait_for_local_block(&self, want: L2BlockNumber) {
-        self.0
-            .subscribe()
-            .wait_for(|inner| matches!(inner.local_block, Some(got) if got >= want))
-            .await
-            .unwrap();
+    pub async fn wait_for_local_block(&self, ctx: &ctx::Ctx, want: L2BlockNumber) -> ctx::OrCanceled<()> {
+        sync::wait_for(
+            ctx,
+            &mut self.0.subscribe(),
+            |inner| matches!(inner.local_block, Some(got) if got >= want),
+        ).await?;
+        Ok(())
     }
 
     pub async fn wait_for_main_node_block(

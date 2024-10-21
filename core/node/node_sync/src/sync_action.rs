@@ -1,6 +1,7 @@
 use tokio::sync::mpsc;
 use zksync_state_keeper::io::{L1BatchParams, L2BlockParams};
 use zksync_types::{L1BatchNumber, L2BlockNumber};
+use zksync_concurrency::{ctx, ctx::channel};
 
 use super::{fetcher::FetchedTransaction, metrics::QUEUE_METRICS};
 
@@ -72,7 +73,7 @@ impl ActionQueueSender {
 /// by collecting the fetched data in memory until it gets processed by the different entities.
 #[derive(Debug)]
 pub struct ActionQueue {
-    receiver: mpsc::Receiver<SyncAction>,
+    receiver: channel::Receiver<SyncAction>,
     peeked: Option<SyncAction>,
 }
 
@@ -103,16 +104,14 @@ impl ActionQueue {
     /// Removes the first action from the queue.
     pub(super) async fn recv_action(
         &mut self,
-        max_wait: tokio::time::Duration,
-    ) -> Option<SyncAction> {
+        ctx: &ctx::Ctx,
+    ) -> ctx::OrCanceled<SyncAction> {
         if let Some(action) = self.pop_action() {
-            return Some(action);
+            return Ok(action);
         }
-        let action = tokio::time::timeout(max_wait, self.receiver.recv())
-            .await
-            .ok()??;
+        let action = self.receiver.recv(ctx).await?;
         QUEUE_METRICS.action_queue_size.dec_by(1);
-        Some(action)
+        Ok(action)
     }
 
     /// Returns the first action from the queue without removing it.
@@ -127,15 +126,14 @@ impl ActionQueue {
     /// Returns the first action from the queue without removing it.
     pub(super) async fn peek_action_async(
         &mut self,
-        max_wait: tokio::time::Duration,
-    ) -> Option<SyncAction> {
+        ctx: &ctx::Ctx,
+    ) -> ctx::OrCanceled<SyncAction> {
         if let Some(action) = &self.peeked {
-            return Some(action.clone());
+            return Ok(action.clone());
         }
-        self.peeked = tokio::time::timeout(max_wait, self.receiver.recv())
-            .await
-            .ok()?;
-        self.peeked.clone()
+        let action = self.receiver.recv(ctx).await?;
+        self.peeked = Some(action.clone()); 
+        Ok(action)
     }
 }
 

@@ -8,6 +8,7 @@ use test_casing::test_casing;
 use tokio::sync::RwLock;
 use zksync_dal::{ConnectionPool, Core};
 use zksync_types::{L2BlockNumber, StorageLog};
+use zksync_concurrency::{ctx, testonly::abort_on_panic};
 
 use super::*;
 use crate::test_utils::{
@@ -88,38 +89,37 @@ async fn rocksdb_storage_basics() {
     }
 }
 
-async fn sync_test_storage(dir: &TempDir, conn: &mut Connection<'_, Core>) -> RocksdbStorage {
-    let (_stop_sender, stop_receiver) = watch::channel(false);
+async fn sync_test_storage(ctx: &ctx::Ctx, dir: &TempDir, conn: &mut Connection<'_, Core>) -> RocksdbStorage {
     let builder = RocksdbStorage::builder(dir.path())
         .await
         .expect("Failed initializing RocksDB");
     builder
-        .synchronize(conn, &stop_receiver, None)
+        .synchronize(ctx, conn, None)
         .await
-        .unwrap()
         .expect("Storage synchronization unexpectedly stopped")
 }
 
 async fn sync_test_storage_and_check_recovery(
+    ctx: &ctx::Ctx,
     dir: &TempDir,
     conn: &mut Connection<'_, Core>,
     expect_recovery: bool,
 ) -> RocksdbStorage {
-    let (_stop_sender, stop_receiver) = watch::channel(false);
     let mut builder = RocksdbStorage::builder(dir.path())
         .await
         .expect("Failed initializing RocksDB");
-    let was_recovered = builder.ensure_ready(conn, &stop_receiver).await.unwrap();
+    let was_recovered = builder.ensure_ready(ctx, conn).await.unwrap();
     assert_eq!(was_recovered, expect_recovery);
     builder
-        .synchronize(conn, &stop_receiver, None)
+        .synchronize(ctx, conn, None)
         .await
-        .unwrap()
         .expect("Storage synchronization unexpectedly stopped")
 }
 
 #[tokio::test]
 async fn rocksdb_storage_syncing_with_postgres() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     prepare_postgres(&mut conn).await;
@@ -128,9 +128,9 @@ async fn rocksdb_storage_syncing_with_postgres() {
     create_l1_batch(&mut conn, L1BatchNumber(1), &storage_logs).await;
 
     let dir = TempDir::new().expect("cannot create temporary dir for state keeper");
-    let mut storage = sync_test_storage(&dir, &mut conn).await;
+    let mut storage = sync_test_storage(ctx, &dir, &mut conn).await;
 
-    assert_eq!(storage.l1_batch_number().await, Some(L1BatchNumber(2)));
+    assert_eq!(storage.l1_batch_number().await.unwrap(), Some(L1BatchNumber(2)));
     for log in &storage_logs {
         assert_eq!(storage.read_value(&log.key), log.value);
     }
@@ -138,6 +138,8 @@ async fn rocksdb_storage_syncing_with_postgres() {
 
 #[tokio::test]
 async fn rocksdb_storage_syncing_fault_tolerance() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     prepare_postgres(&mut conn).await;
@@ -149,7 +151,6 @@ async fn rocksdb_storage_syncing_fault_tolerance() {
     }
 
     let dir = TempDir::new().expect("cannot create temporary dir for state keeper");
-    let (stop_sender, stop_receiver) = watch::channel(false);
     let mut storage = RocksdbStorage::builder(dir.path())
         .await
         .expect("Failed initializing RocksDB");
@@ -158,28 +159,24 @@ async fn rocksdb_storage_syncing_fault_tolerance() {
         assert_eq!(number, expected_l1_batch_number);
         expected_l1_batch_number += 1;
         if number == L1BatchNumber(2) {
-            stop_sender.send_replace(true);
+            //TODO: stop_sender.send_replace(true);
         }
     }));
-    let storage = storage
-        .synchronize(&mut conn, &stop_receiver, None)
-        .await
-        .unwrap();
-    assert!(storage.is_none());
+    assert_matches!(storage
+        .synchronize(ctx, &mut conn, None)
+        .await, Err(ctx::Error::Canceled(_)));
 
     // Resume storage syncing and check that it completes.
     let storage = RocksdbStorage::builder(dir.path())
         .await
         .expect("Failed initializing RocksDB");
-    assert_eq!(storage.l1_batch_number().await, Some(L1BatchNumber(3)));
+    assert_eq!(storage.l1_batch_number().await.unwrap(), Some(L1BatchNumber(3)));
 
-    let (_stop_sender, stop_receiver) = watch::channel(false);
     let mut storage = storage
-        .synchronize(&mut conn, &stop_receiver, None)
+        .synchronize(ctx, &mut conn, None)
         .await
-        .unwrap()
         .expect("Storage synchronization unexpectedly stopped");
-    assert_eq!(storage.l1_batch_number().await, Some(L1BatchNumber(6)));
+    assert_eq!(storage.l1_batch_number().await.unwrap(), Some(L1BatchNumber(6)));
     for log in &storage_logs {
         assert_eq!(storage.read_value(&log.key), log.value);
         assert!(!storage.is_write_initial(&log.key));
@@ -202,6 +199,8 @@ async fn insert_factory_deps(
 
 #[tokio::test]
 async fn rocksdb_storage_revert() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     prepare_postgres(&mut conn).await;
@@ -229,10 +228,10 @@ async fn rocksdb_storage_revert() {
     create_l1_batch(&mut conn, L1BatchNumber(2), &inserted_storage_logs).await;
 
     let dir = TempDir::new().expect("cannot create temporary dir for state keeper");
-    let mut storage = sync_test_storage(&dir, &mut conn).await;
+    let mut storage = sync_test_storage(ctx, &dir, &mut conn).await;
 
     // Perform some sanity checks before the revert.
-    assert_eq!(storage.l1_batch_number().await, Some(L1BatchNumber(3)));
+    assert_eq!(storage.l1_batch_number().await.unwrap(), Some(L1BatchNumber(3)));
     {
         for log in &inserted_storage_logs {
             assert_eq!(storage.read_value(&log.key), log.value);
@@ -250,7 +249,7 @@ async fn rocksdb_storage_revert() {
     }
 
     storage.revert(&mut conn, L1BatchNumber(1)).await.unwrap();
-    assert_eq!(storage.l1_batch_number().await, Some(L1BatchNumber(2)));
+    assert_eq!(storage.l1_batch_number().await.unwrap(), Some(L1BatchNumber(2)));
     {
         for log in &inserted_storage_logs {
             assert_eq!(storage.read_value(&log.key), H256::zero());
@@ -274,6 +273,8 @@ async fn rocksdb_storage_revert() {
 #[test_casing(4, [RocksdbStorage::DESIRED_LOG_CHUNK_SIZE, 20, 5, 1])]
 #[tokio::test]
 async fn low_level_snapshot_recovery(log_chunk_size: u64) {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     let (snapshot_recovery, mut storage_logs) =
@@ -283,14 +284,13 @@ async fn low_level_snapshot_recovery(log_chunk_size: u64) {
     let mut storage = RocksdbStorage::new(dir.path().into(), RocksdbStorageOptions::default())
         .await
         .unwrap();
-    let (_stop_sender, stop_receiver) = watch::channel(false);
     let (_, next_l1_batch) = storage
-        .ensure_ready(&mut conn, log_chunk_size, &stop_receiver)
+        .ensure_ready(ctx, &mut conn, log_chunk_size)
         .await
         .unwrap();
     assert_eq!(next_l1_batch, snapshot_recovery.l1_batch_number + 1);
     assert_eq!(
-        storage.l1_batch_number().await,
+        storage.l1_batch_number().await.unwrap(),
         Some(snapshot_recovery.l1_batch_number + 1)
     );
 
@@ -308,6 +308,8 @@ async fn low_level_snapshot_recovery(log_chunk_size: u64) {
 
 #[tokio::test]
 async fn recovering_factory_deps_from_snapshot() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     let (snapshot_recovery, _) = prepare_postgres_for_snapshot_recovery(&mut conn).await;
@@ -326,7 +328,7 @@ async fn recovering_factory_deps_from_snapshot() {
     }
 
     let dir = TempDir::new().expect("cannot create temporary dir for state keeper");
-    let mut storage = sync_test_storage(&dir, &mut conn).await;
+    let mut storage = sync_test_storage(ctx, &dir, &mut conn).await;
 
     for (bytecode_hash, bytecode) in &all_factory_deps {
         assert_eq!(storage.load_factory_dep(*bytecode_hash).unwrap(), *bytecode);
@@ -335,6 +337,8 @@ async fn recovering_factory_deps_from_snapshot() {
 
 #[tokio::test]
 async fn recovering_from_snapshot_and_following_logs() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     let (snapshot_recovery, mut storage_logs) =
@@ -373,7 +377,7 @@ async fn recovering_from_snapshot_and_following_logs() {
     create_l1_batch(&mut conn, snapshot_recovery.l1_batch_number + 2, &[]).await;
 
     let dir = TempDir::new().expect("cannot create temporary dir for state keeper");
-    let mut storage = sync_test_storage_and_check_recovery(&dir, &mut conn, true).await;
+    let mut storage = sync_test_storage_and_check_recovery(ctx, &dir, &mut conn, true).await;
 
     for (i, log) in new_storage_logs.iter().enumerate() {
         assert_eq!(storage.read_value(&log.key), log.value);
@@ -400,11 +404,13 @@ async fn recovering_from_snapshot_and_following_logs() {
     }
 
     drop(storage);
-    sync_test_storage_and_check_recovery(&dir, &mut conn, false).await;
+    sync_test_storage_and_check_recovery(ctx, &dir, &mut conn, false).await;
 }
 
 #[tokio::test]
 async fn recovery_fault_tolerance() {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = pool.connection().await.unwrap();
     let (_, storage_logs) = prepare_postgres_for_snapshot_recovery(&mut conn).await;
@@ -414,25 +420,23 @@ async fn recovery_fault_tolerance() {
     let mut storage = RocksdbStorage::new(dir.path().into(), RocksdbStorageOptions::default())
         .await
         .unwrap();
-    let (stop_sender, stop_receiver) = watch::channel(false);
     let mut synced_chunk_count = 0_u64;
     storage.listener.on_logs_chunk_recovered = Arc::new(RwLock::new(move |chunk_id| {
         assert_eq!(chunk_id, synced_chunk_count);
         synced_chunk_count += 1;
         if synced_chunk_count == 2 {
-            stop_sender.send_replace(true);
+            //stop_sender.send_replace(true);
         }
     }));
 
     let err = storage
-        .ensure_ready(&mut conn, log_chunk_size, &stop_receiver)
+        .ensure_ready(ctx, &mut conn, log_chunk_size)
         .await
         .unwrap_err();
-    assert_matches!(err, RocksdbSyncError::Interrupted);
+    assert_matches!(err, ctx::Error::Canceled(_));
     drop(storage);
 
     // Resume recovery and check that no chunks are recovered twice.
-    let (_stop_sender, stop_receiver) = watch::channel(false);
     let mut storage = RocksdbStorage::new(dir.path().into(), RocksdbStorageOptions::default())
         .await
         .unwrap();
@@ -440,7 +444,7 @@ async fn recovery_fault_tolerance() {
         assert!(chunk_id >= 2);
     }));
     storage
-        .ensure_ready(&mut conn, log_chunk_size, &stop_receiver)
+        .ensure_ready(ctx, &mut conn, log_chunk_size)
         .await
         .unwrap();
     for log in &storage_logs {

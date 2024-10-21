@@ -4,26 +4,25 @@ use backon::{ConstantBuilder, ExponentialBuilder, Retryable};
 use tempfile::TempDir;
 use tokio::{
     runtime::Handle,
-    sync::{watch, RwLock},
-    task::JoinHandle,
+    sync::{RwLock},
 };
 use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_node_genesis::{insert_genesis_batch, GenesisParams};
 use zksync_state::{interface::ReadStorage, OwnedStorage, PostgresStorage};
 use zksync_test_account::Account;
 use zksync_types::{AccountTreeId, L1BatchNumber, L2ChainId, StorageKey};
+use zksync_concurrency::{ctx,scope,testonly::abort_on_panic};
 
 use crate::{
     storage::StorageLoader,
     tests::{fund, store_l1_batches, IoMock},
-    BatchExecuteData, VmRunnerIo, VmRunnerStorage,
+    BatchExecuteData, VmRunnerIo, VmRunnerStorage, StorageSyncTask,
 };
 
 #[derive(Debug)]
 struct StorageTester {
     db_dir: TempDir,
     pool: ConnectionPool<Core>,
-    tasks: Vec<JoinHandle<()>>,
 }
 
 impl StorageTester {
@@ -31,27 +30,20 @@ impl StorageTester {
         Self {
             db_dir: TempDir::new().unwrap(),
             pool,
-            tasks: Vec::new(),
         }
     }
 
     async fn create_storage(
         &mut self,
         io_mock: Arc<RwLock<IoMock>>,
-    ) -> anyhow::Result<VmRunnerStorage<Arc<RwLock<IoMock>>>> {
-        let (vm_runner_storage, task) = VmRunnerStorage::new(
+    ) -> anyhow::Result<(VmRunnerStorage<Arc<RwLock<IoMock>>>,StorageSyncTask<Arc<RwLock<IoMock>>>)> {
+        VmRunnerStorage::new(
             self.pool.clone(),
             self.db_dir.path().to_str().unwrap().to_owned(),
             io_mock,
             L2ChainId::default(),
         )
-        .await?;
-        let handle = tokio::task::spawn(async move {
-            let (_stop_sender, stop_receiver) = watch::channel(false);
-            task.run(stop_receiver).await.unwrap()
-        });
-        self.tasks.push(handle);
-        Ok(vm_runner_storage)
+        .await
     }
 }
 
@@ -190,6 +182,8 @@ async fn rerun_storage_on_existing_data() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn continuously_load_new_batches() -> anyhow::Result<()> {
+    abort_on_panic();
+    let ctx = &ctx::test_root(&ctx::RealClock);
     let connection_pool = ConnectionPool::<Core>::test_pool().await;
     let mut conn = connection_pool.connection().await.unwrap();
     let genesis_params = GenesisParams::mock();
@@ -204,47 +198,50 @@ async fn continuously_load_new_batches() -> anyhow::Result<()> {
 
     let mut tester = StorageTester::new(connection_pool.clone());
     let io_mock = Arc::new(RwLock::new(IoMock::default()));
-    let storage = tester.create_storage(io_mock.clone()).await?;
-    // No batches available yet
-    assert!(storage.load_batch(L1BatchNumber(1)).await?.is_none());
+    scope::run!(ctx,|ctx,s| async {
+        let (storage,task) = tester.create_storage(io_mock.clone()).await?;
+        s.spawn_bg(task.run(ctx));
+        // No batches available yet
+        assert!(storage.load_batch(L1BatchNumber(1)).await?.is_none());
 
-    // Generate one batch and persist it in Postgres
-    store_l1_batches(
-        &mut connection_pool.connection().await?,
-        1..=1,
-        &genesis_params,
-        &mut accounts,
-    )
-    .await?;
-    io_mock.write().await.max += 1;
+        // Generate one batch and persist it in Postgres
+        store_l1_batches(
+            &mut connection_pool.connection().await?,
+            1..=1,
+            &genesis_params,
+            &mut accounts,
+        )
+        .await?;
+        io_mock.write().await.max += 1;
 
-    // Load batch and mark it as processed
-    let (batch_data, _) = storage.load_batch_eventually(L1BatchNumber(1)).await?;
-    assert_eq!(batch_data.l1_batch_env.number, L1BatchNumber(1));
-    io_mock.write().await.current += 1;
+        // Load batch and mark it as processed
+        let (batch_data, _) = storage.load_batch_eventually(L1BatchNumber(1)).await?;
+        assert_eq!(batch_data.l1_batch_env.number, L1BatchNumber(1));
+        io_mock.write().await.current += 1;
 
-    // No more batches after that
-    assert!(storage.batch_stays_unloaded(L1BatchNumber(2)).await);
+        // No more batches after that
+        assert!(storage.batch_stays_unloaded(L1BatchNumber(2)).await);
 
-    // Generate one more batch and persist it in Postgres
-    store_l1_batches(
-        &mut connection_pool.connection().await?,
-        2..=2,
-        &genesis_params,
-        &mut accounts,
-    )
-    .await?;
-    io_mock.write().await.max += 1;
+        // Generate one more batch and persist it in Postgres
+        store_l1_batches(
+            &mut connection_pool.connection().await?,
+            2..=2,
+            &genesis_params,
+            &mut accounts,
+        )
+        .await?;
+        io_mock.write().await.max += 1;
 
-    // Load batch and mark it as processed
-    let (batch_data, _) = storage.load_batch_eventually(L1BatchNumber(2)).await?;
-    assert_eq!(batch_data.l1_batch_env.number, L1BatchNumber(2));
-    io_mock.write().await.current += 1;
+        // Load batch and mark it as processed
+        let (batch_data, _) = storage.load_batch_eventually(L1BatchNumber(2)).await?;
+        assert_eq!(batch_data.l1_batch_env.number, L1BatchNumber(2));
+        io_mock.write().await.current += 1;
 
-    // No more batches after that
-    assert!(storage.batch_stays_unloaded(L1BatchNumber(3)).await);
+        // No more batches after that
+        assert!(storage.batch_stays_unloaded(L1BatchNumber(3)).await);
 
-    Ok(())
+        Ok(())
+    }).await
 }
 
 #[tokio::test]

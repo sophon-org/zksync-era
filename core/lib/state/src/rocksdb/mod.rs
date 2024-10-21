@@ -229,11 +229,10 @@ impl RocksdbStorageBuilder {
     /// Propagates RocksDB and Postgres errors.
     pub async fn roll_back(
         mut self,
-        ctx: &ctx::Ctx,
         storage: &mut Connection<'_, Core>,
         last_l1_batch_to_keep: L1BatchNumber,
     ) -> anyhow::Result<()> {
-        self.0.revert(ctx, storage, last_l1_batch_to_keep).await
+        self.0.revert(storage, last_l1_batch_to_keep).await
     }
 
     /// Returns the underlying storage without any checks. Should only be used in test code.
@@ -455,7 +454,6 @@ impl RocksdbStorage {
 
     async fn revert(
         &mut self,
-        ctx: &ctx::Ctx,
         connection: &mut Connection<'_, Core>,
         last_l1_batch_to_keep: L1BatchNumber,
     ) -> anyhow::Result<()> {
@@ -463,19 +461,19 @@ impl RocksdbStorage {
 
         tracing::info!("Getting logs that should be applied to revert the state...");
         let stage_start = Instant::now();
-        let logs = ctx.wait(connection
+        let logs = connection
             .storage_logs_dal()
-            .get_storage_logs_for_revert(last_l1_batch_to_keep))
-            .await?
+            .get_storage_logs_for_revert(last_l1_batch_to_keep)
+            .await
             .context("failed getting logs for revert")?;
         tracing::info!("Got {} logs, took {:?}", logs.len(), stage_start.elapsed());
 
         tracing::info!("Getting number of last L2 block for L1 batch #{last_l1_batch_to_keep}...");
         let stage_start = Instant::now();
-        let (_, last_l2_block_to_keep) = ctx.wait(connection
+        let (_, last_l2_block_to_keep) = connection
             .blocks_dal()
             .get_l2_block_range_of_l1_batch(last_l1_batch_to_keep)
-            ).await?.context("get_l2_block_range_of_l1_batch()")?
+            .await?
             .context("L1 batch should contain at least one L2 block")?;
         tracing::info!(
             "Got L2 block number {last_l2_block_to_keep}, took {:?}",
@@ -484,10 +482,10 @@ impl RocksdbStorage {
 
         tracing::info!("Getting factory deps that need to be removed...");
         let stage_start = Instant::now();
-        let factory_deps = ctx.wait(connection
+        let factory_deps = connection
             .factory_deps_dal()
             .get_factory_deps_for_revert(last_l2_block_to_keep)
-        ).await?.context("get_factory_deps_for_revert()")?;
+            .await?;
         tracing::info!(
             "Got {} factory deps, took {:?}",
             factory_deps.len(),
@@ -523,8 +521,7 @@ impl RocksdbStorage {
             self.db.write(batch)
                 .context("failed to save state data into RocksDB")
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Saves the pending changes to RocksDB. Must be executed on a Tokio thread.

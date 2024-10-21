@@ -7,12 +7,13 @@ use std::{
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{RwLock};
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_state::{
     AsyncCatchupTask, BatchDiff, OwnedStorage, RocksdbCell, RocksdbStorage, RocksdbStorageBuilder,
     RocksdbWithMemory,
 };
+use zksync_concurrency::{ctx, error::Wrap as _};
 use zksync_types::{block::L2BlockExecutionData, L1BatchNumber, L2ChainId};
 use zksync_vm_executor::storage::L1BatchParamsProvider;
 use zksync_vm_interface::{L1BatchEnv, SystemEnv};
@@ -290,20 +291,16 @@ impl<Io: VmRunnerIo> StorageSyncTask<Io> {
     /// # Errors
     ///
     /// Propagates RocksDB and Postgres errors.
-    pub async fn run(self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
         const SLEEP_INTERVAL: Duration = Duration::from_millis(50);
 
-        self.catchup_task.run(stop_receiver.clone()).await?;
-        let rocksdb = self.rocksdb_cell.wait().await?;
+        self.catchup_task.run(ctx).await?;
+        let rocksdb = self.rocksdb_cell.wait().await.context("catchup failed")?;
         loop {
-            if *stop_receiver.borrow() {
-                tracing::info!("`StorageSyncTask` was interrupted");
-                return Ok(());
-            }
-            let mut conn = self.pool.connection_tagged(self.io.name()).await?;
+            let mut conn = self.pool.connection_tagged(self.io.name()).await.context("connection()")?;
             let latest_processed_batch = self.io.latest_processed_batch(&mut conn).await?;
             let rocksdb_builder = RocksdbStorageBuilder::from_rocksdb(rocksdb.clone());
-            if rocksdb_builder.l1_batch_number().await == Some(latest_processed_batch + 1) {
+            if rocksdb_builder.l1_batch_number().await? == Some(latest_processed_batch + 1) {
                 // RocksDB is already caught up, we might not need to do anything.
                 // Just need to check that the memory diff is up-to-date in case this is a fresh start.
                 let last_ready_batch = self.io.last_ready_to_be_loaded_batch(&mut conn).await?;
@@ -323,13 +320,9 @@ impl<Io: VmRunnerIo> StorageSyncTask<Io> {
             // will cause them to have an inconsistent view on DB which we consider to be an
             // undefined behavior.
             let rocksdb = rocksdb_builder
-                .synchronize(&mut conn, &stop_receiver, Some(latest_processed_batch))
+                .synchronize(ctx, &mut conn, Some(latest_processed_batch))
                 .await
-                .context("Failed to catch up state keeper RocksDB storage to Postgres")?;
-            let Some(rocksdb) = rocksdb else {
-                tracing::info!("`StorageSyncTask` was interrupted during RocksDB synchronization");
-                return Ok(());
-            };
+                .wrap("Failed to catch up state keeper RocksDB storage to Postgres")?;
             let mut state = self.state.write().await;
             state.rocksdb = Some(rocksdb);
             state.l1_batch_number = latest_processed_batch;
@@ -359,17 +352,17 @@ impl<Io: VmRunnerIo> StorageSyncTask<Io> {
                 let state_diff = conn
                     .storage_logs_dal()
                     .get_touched_slots_for_l1_batch(l1_batch_number)
-                    .await?;
+                    .await.context("get_touched_slots_for_l1_batch()")?;
                 let enum_index_diff = conn
                     .storage_logs_dedup_dal()
                     .initial_writes_for_batch(l1_batch_number)
-                    .await?
+                    .await.context("initial_writes_for_batch()")?
                     .into_iter()
                     .collect::<HashMap<_, _>>();
                 let factory_dep_diff = conn
                     .blocks_dal()
                     .get_l1_batch_factory_deps(l1_batch_number)
-                    .await?;
+                    .await.context("get_l1_batch_factory_deps()")?;
                 let diff = BatchDiff {
                     state_diff,
                     enum_index_diff,

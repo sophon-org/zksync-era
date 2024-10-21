@@ -70,7 +70,7 @@ impl TestConfig {
 }
 
 #[derive(Default)]
-struct Task(Option<AsyncCatchupTask>);
+pub(super) struct Task(Option<AsyncCatchupTask>);
 
 impl Task {
     pub(crate) async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {

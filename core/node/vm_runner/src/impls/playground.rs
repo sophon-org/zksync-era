@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::{
     fs,
-    sync::{oneshot, watch},
+    sync::{watch},
 };
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_health_check::{Health, HealthStatus, HealthUpdater, ReactiveHealthCheck};
@@ -23,6 +23,7 @@ use zksync_vm_interface::{
     utils::{DivergenceHandler, VmDump},
     L1BatchEnv, L2BlockEnv, SystemEnv,
 };
+use zksync_concurrency::{oneshot,ctx};
 
 use crate::{
     storage::{PostgresLoader, StorageLoader},
@@ -237,7 +238,7 @@ impl VmPlayground {
         };
 
         let builder = RocksdbStorage::builder(path.as_ref()).await?;
-        let current_l1_batch = builder.l1_batch_number().await;
+        let current_l1_batch = builder.l1_batch_number().await?;
         if current_l1_batch <= Some(last_retained_batch) {
             tracing::info!("Resetting RocksDB cache is not required: its current batch #{current_l1_batch:?} is lower than the target");
             return Ok(());
@@ -254,7 +255,7 @@ impl VmPlayground {
     /// # Errors
     ///
     /// Propagates RocksDB and Postgres errors.
-    pub async fn run(self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
         if let VmPlaygroundStorage::Rocksdb { path, .. } = &self.storage {
             fs::create_dir_all(path)
                 .await
@@ -295,7 +296,7 @@ impl VmPlayground {
             Arc::new(self.output_handler_factory),
             Box::new(self.batch_executor_factory),
         );
-        vm_runner.run(&stop_receiver).await
+        vm_runner.run(ctx).await
     }
 }
 
@@ -307,16 +308,10 @@ pub struct VmPlaygroundLoaderTask {
 
 impl VmPlaygroundLoaderTask {
     /// Runs a task until a stop signal is received.
-    pub async fn run(self, mut stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
-        let task = tokio::select! {
-            biased;
-            _ = stop_receiver.changed() => return Ok(()),
-            res = self.inner => match res {
-                Ok(task) => task,
-                Err(_) => anyhow::bail!("VM playground stopped before spawning loader task"),
-            }
-        };
-        task.run(stop_receiver).await
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
+        // TODO: should it really be reported as internal error, rather than just cancellation?
+        let task = self.inner.recv(ctx).await.context("VM playground stopped before spawning loader task")?;
+        task.run(ctx).await
     }
 }
 

@@ -1,14 +1,15 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, };
 
 use anyhow::Context;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use tokio::{
-    sync::{oneshot, watch},
+    sync::{oneshot},
     task::JoinHandle,
 };
 use zksync_dal::{ConnectionPool, Core};
 use zksync_state::interface::StorageViewCache;
+use zksync_concurrency::{ctx,time};
 use zksync_types::{L1BatchNumber, Transaction};
 use zksync_vm_interface::{
     BatchTransactionExecutionResult, FinishedL1Batch, L1BatchEnv, L2BlockEnv, SystemEnv,
@@ -237,24 +238,20 @@ impl<Io: VmRunnerIo> ConcurrentOutputHandlerFactoryTask<Io> {
     /// # Errors
     ///
     /// Propagates DB errors.
-    pub async fn run(self, stop_receiver: watch::Receiver<bool>) -> anyhow::Result<()> {
-        const SLEEP_INTERVAL: Duration = Duration::from_millis(50);
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
+        const SLEEP_INTERVAL: time::Duration = time::Duration::milliseconds(50);
 
-        let mut conn = self.pool.connection_tagged(self.io.name()).await?;
+        let mut conn = self.pool.connection_tagged(self.io.name()).await.context("connection()")?;
         let mut latest_processed_batch = self.io.latest_processed_batch(&mut conn).await?;
         drop(conn);
         loop {
-            if *stop_receiver.borrow() {
-                tracing::info!("`ConcurrentOutputHandlerFactoryTask` was interrupted");
-                return Ok(());
-            }
             match self.state.remove(&(latest_processed_batch + 1)) {
                 None => {
                     tracing::debug!(
                         "Output handler for batch #{} has not been created yet",
                         latest_processed_batch + 1
                     );
-                    tokio::time::sleep(SLEEP_INTERVAL).await;
+                    ctx.sleep(SLEEP_INTERVAL).await?;
                 }
                 Some((_, receiver)) => {
                     // Wait until the `JoinHandle` is sent through the receiver, happens when
@@ -268,7 +265,7 @@ impl<Io: VmRunnerIo> ConcurrentOutputHandlerFactoryTask<Io> {
                         .await
                         .context("failed to await for batch to be processed")??;
                     latest_processed_batch += 1;
-                    let mut conn = self.pool.connection_tagged(self.io.name()).await?;
+                    let mut conn = self.pool.connection_tagged(self.io.name()).await.context("connection()")?;
                     self.io
                         .mark_l1_batch_as_completed(&mut conn, latest_processed_batch)
                         .await?;

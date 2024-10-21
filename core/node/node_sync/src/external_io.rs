@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -20,6 +20,7 @@ use zksync_types::{
     protocol_version::{ProtocolSemanticVersion, VersionPatch},
     L1BatchNumber, L2BlockNumber, L2ChainId, ProtocolVersionId, Transaction, H256,
 };
+use zksync_concurrency::ctx;
 use zksync_utils::bytes_to_be_words;
 use zksync_vm_executor::storage::L1BatchParamsProvider;
 
@@ -222,33 +223,31 @@ impl StateKeeperIO for ExternalIO {
 
     async fn wait_for_new_batch_params(
         &mut self,
+        ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<L1BatchParams>> {
+    ) -> ctx::Result<L1BatchParams> {
         tracing::debug!("Waiting for the new batch params");
-        let Some(action) = self.actions.recv_action(max_wait).await else {
-            return Ok(None);
-        };
-        match action {
+        match self.actions.recv_action(ctx).await? {
             SyncAction::OpenBatch {
                 params,
                 number,
                 first_l2_block_number,
             } => {
-                anyhow::ensure!(
-                    number == cursor.l1_batch,
-                    "Batch number mismatch: expected {}, got {number}",
-                    cursor.l1_batch
-                );
-                anyhow::ensure!(
-                    first_l2_block_number == cursor.next_l2_block,
-                    "L2 block number mismatch: expected {}, got {first_l2_block_number}",
-                    cursor.next_l2_block
-                );
-
+                if number != cursor.l1_batch {
+                    return Err(anyhow::format_err!(
+                        "Batch number mismatch: expected {}, got {number}",
+                        cursor.l1_batch
+                    ).into());
+                }
+                if first_l2_block_number != cursor.next_l2_block {
+                    return Err(anyhow::format_err!(
+                        "First L2 block number mismatch: expected {}, got {first_l2_block_number}",
+                        cursor.next_l2_block
+                    ).into());
+                }
                 self.pool
                     .connection_tagged("sync_layer")
-                    .await?
+                    .await.context("connection()")?
                     .blocks_dal()
                     .insert_l1_batch(UnsealedL1BatchHeader {
                         number: cursor.l1_batch,
@@ -257,53 +256,46 @@ impl StateKeeperIO for ExternalIO {
                         fee_address: params.operator_address,
                         fee_input: params.fee_input,
                     })
-                    .await?;
-                return Ok(Some(params));
+                    .await.context("insert_l1_batch()")?;
+                return Ok(params);
             }
             other => {
-                anyhow::bail!("unexpected action in the action queue: {other:?}");
+                Err(anyhow::format_err!("unexpected action in the action queue: {other:?}").into())
             }
         }
     }
 
     async fn wait_for_new_l2_block_params(
         &mut self,
+        ctx: &ctx::Ctx,
         cursor: &IoCursor,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<L2BlockParams>> {
+    ) -> ctx::Result<L2BlockParams> {
         // Wait for the next L2 block to appear in the queue.
-        let Some(action) = self.actions.recv_action(max_wait).await else {
-            return Ok(None);
-        };
-        match action {
+        match self.actions.recv_action(ctx).await? {
             SyncAction::L2Block { params, number } => {
-                anyhow::ensure!(
-                    number == cursor.next_l2_block,
-                    "L2 block number mismatch: expected {}, got {number}",
-                    cursor.next_l2_block
-                );
-                return Ok(Some(params));
+                if number != cursor.next_l2_block {
+                    return Err(anyhow::format_err!(
+                        "L2 block number mismatch: expected {}, got {number}",
+                        cursor.next_l2_block
+                    ).into());
+                }
+                return Ok(params);
             }
             other => {
-                anyhow::bail!(
-                    "Unexpected action in the queue while waiting for the next L2 block: {other:?}"
-                );
+                Err(anyhow::format_err!("unexpected action in the queue while waiting for the next L2 block: {other:?}").into())
             }
         }
     }
 
     async fn wait_for_next_tx(
         &mut self,
-        max_wait: Duration,
-    ) -> anyhow::Result<Option<Transaction>> {
+        ctx: &ctx::Ctx,
+    ) -> ctx::Result<Option<Transaction>> {
         tracing::debug!(
             "Waiting for the new tx, next action is {:?}",
             self.actions.peek_action()
         );
-        let Some(action) = self.actions.peek_action_async(max_wait).await else {
-            return Ok(None);
-        };
-        match action {
+        match self.actions.peek_action_async(ctx).await {
             SyncAction::Tx(tx) => {
                 self.actions.pop_action().unwrap();
                 return Ok(Some(Transaction::from(*tx)));

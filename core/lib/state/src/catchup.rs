@@ -185,6 +185,7 @@ mod tests {
     use tempfile::TempDir;
     use test_casing::test_casing;
     use zksync_types::L2BlockNumber;
+    use zksync_concurrency::{ctx, scope, testonly::abort_on_panic};
 
     use super::*;
     use crate::{
@@ -194,6 +195,8 @@ mod tests {
 
     #[tokio::test]
     async fn catching_up_basics() {
+        abort_on_panic();
+        let ctx = &ctx::test_root(&ctx::RealClock);
         let pool = ConnectionPool::<Core>::test_pool().await;
         let mut conn = pool.connection().await.unwrap();
         prepare_postgres(&mut conn).await;
@@ -203,34 +206,34 @@ mod tests {
         drop(conn);
 
         let temp_dir = TempDir::new().unwrap();
-        let (task, rocksdb_cell) =
-            AsyncCatchupTask::new(pool.clone(), temp_dir.path().to_str().unwrap().to_owned());
-        let (_stop_sender, stop_receiver) = watch::channel(false);
-        let task_handle = tokio::spawn(task.run(stop_receiver));
+        scope::run!(ctx, |ctx,s| async {
+            let (task, rocksdb_cell) = AsyncCatchupTask::new(pool.clone(), temp_dir.path().to_str().unwrap().to_owned());
+            let task_handle = s.spawn(task.run(ctx));
 
-        let initial_state = rocksdb_cell.ensure_initialized().await.unwrap();
-        assert_eq!(initial_state.l1_batch_number, None);
+            let initial_state = rocksdb_cell.ensure_initialized().await.unwrap();
+            assert_eq!(initial_state.l1_batch_number, None);
 
-        let db = rocksdb_cell.wait().await.unwrap();
-        assert_eq!(
-            RocksdbStorageBuilder::from_rocksdb(db)
-                .l1_batch_number()
-                .await,
-            Some(L1BatchNumber(2))
-        );
-        task_handle.await.unwrap().unwrap();
-        drop(rocksdb_cell); // should be enough to release RocksDB lock
+            let db = rocksdb_cell.wait().await.unwrap();
+            assert_eq!(
+                RocksdbStorageBuilder::from_rocksdb(db)
+                    .l1_batch_number()
+                    .await?,
+                Some(L1BatchNumber(2))
+            );
+            task_handle.join(ctx).await.unwrap();
+            drop(rocksdb_cell); // should be enough to release RocksDB lock
+            
+            let (task, rocksdb_cell) =
+                AsyncCatchupTask::new(pool, temp_dir.path().to_str().unwrap().to_owned());
+            let task_handle = s.spawn_bg(task.run(ctx));
 
-        let (task, rocksdb_cell) =
-            AsyncCatchupTask::new(pool, temp_dir.path().to_str().unwrap().to_owned());
-        let (_stop_sender, stop_receiver) = watch::channel(false);
-        let task_handle = tokio::spawn(task.run(stop_receiver));
-
-        let initial_state = rocksdb_cell.ensure_initialized().await.unwrap();
-        assert_eq!(initial_state.l1_batch_number, Some(L1BatchNumber(2)));
-
-        task_handle.await.unwrap().unwrap();
-        rocksdb_cell.get().unwrap(); // RocksDB must be caught up at this point
+            let initial_state = rocksdb_cell.ensure_initialized().await.unwrap();
+            assert_eq!(initial_state.l1_batch_number, Some(L1BatchNumber(2)));
+            task_handle.join(ctx).await.unwrap();
+            rocksdb_cell.get().unwrap(); // RocksDB must be caught up at this point
+            
+            Ok(())
+        }).await.unwrap();
     }
 
     #[derive(Debug)]
@@ -246,6 +249,8 @@ mod tests {
     #[test_casing(2, CancellationScenario::ALL)]
     #[tokio::test]
     async fn catching_up_cancellation(scenario: CancellationScenario) {
+        abort_on_panic();
+        let ctx = &ctx::test_root(&ctx::RealClock);
         let pool = ConnectionPool::<Core>::test_pool().await;
         let mut conn = pool.connection().await.unwrap();
         prepare_postgres(&mut conn).await;
@@ -257,12 +262,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (task, rocksdb_cell) =
             AsyncCatchupTask::new(pool.clone(), temp_dir.path().to_str().unwrap().to_owned());
-        let (stop_sender, stop_receiver) = watch::channel(false);
         match scenario {
             CancellationScenario::DropTask => drop(task),
             CancellationScenario::CancelTask => {
-                stop_sender.send_replace(true);
-                task.run(stop_receiver).await.unwrap();
+                //stop_sender.send_replace(true);
+                task.run(ctx).await.unwrap();
             }
         }
 

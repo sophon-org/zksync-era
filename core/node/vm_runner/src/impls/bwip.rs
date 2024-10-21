@@ -2,7 +2,6 @@ use std::{collections::HashSet, sync::Arc};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use tokio::sync::watch;
 use zksync_dal::{Connection, ConnectionPool, Core, CoreDal};
 use zksync_object_store::ObjectStore;
 use zksync_prover_interface::inputs::VMRunWitnessInputData;
@@ -11,6 +10,7 @@ use zksync_types::{
     block::StorageOracleInfo, witness_block_state::WitnessStorageState, L1BatchNumber, L2ChainId,
     H256,
 };
+use zksync_concurrency::ctx;
 use zksync_utils::{bytes_to_chunks, h256_to_u256, u256_to_h256};
 use zksync_vm_interface::{executor::BatchExecutorFactory, L1BatchEnv, L2BlockEnv, SystemEnv};
 
@@ -72,8 +72,8 @@ impl BasicWitnessInputProducer {
     /// # Errors
     ///
     /// Propagates RocksDB and Postgres errors.
-    pub async fn run(self, stop_receiver: &watch::Receiver<bool>) -> anyhow::Result<()> {
-        self.vm_runner.run(stop_receiver).await
+    pub async fn run(self, ctx: &ctx::Ctx) -> ctx::Result<()> {
+        self.vm_runner.run(ctx).await
     }
 }
 
