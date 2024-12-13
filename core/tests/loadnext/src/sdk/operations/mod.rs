@@ -12,6 +12,7 @@ pub use self::{
     execute_contract::ExecuteContractBuilder,
     transfer::{create_transfer_calldata, TransferBuilder},
     withdraw::WithdrawBuilder,
+    mint_erc20::{MintERC20Builder},
 };
 use crate::sdk::{error::ClientError, EthNamespaceClient};
 
@@ -19,6 +20,7 @@ mod deploy_contract;
 mod execute_contract;
 mod transfer;
 mod withdraw;
+mod mint_erc20;
 
 /// Handle for transaction, providing an interface to control its execution.
 /// For obtained handle it's possible to set the polling interval, commit timeout

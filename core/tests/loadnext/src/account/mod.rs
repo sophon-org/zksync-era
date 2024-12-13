@@ -19,7 +19,7 @@ use crate::{
     account_pool::{AddressPool, TestWallet},
     command::{ExpectedOutcome, IncorrectnessModifier, TxCommand, TxType},
     config::{LoadtestConfig, RequestLimiters},
-    constants::{MAX_L1_TRANSACTIONS, POLLING_INTERVAL},
+    constants::{POLLING_INTERVAL},
     report::{Report, ReportBuilder, ReportLabel},
     sdk::{error::ClientError, operations::SyncTransactionHandle},
     utils::format_gwei,
@@ -106,7 +106,7 @@ impl AccountLifespan {
             polling_interval,
         }
     }
-
+    
     pub async fn run(self, limiters: &RequestLimiters) {
         let duration = self.config.duration();
         let tx_execution_task = self.clone().run_tx_execution();
@@ -127,24 +127,34 @@ impl AccountLifespan {
     }
 
     async fn run_tx_execution(mut self) -> Result<(), Aborted> {
+        // TODO make the initial contract deployment something optional. By default for now it's disabled.
         // Every account starts with deploying a contract.
-        let deploy_command = TxCommand {
-            command_type: TxType::DeployContract,
-            modifier: IncorrectnessModifier::None,
-            to: Address::zero(),
-            amount: U256::zero(),
-        };
-        self.execute_command(deploy_command.clone()).await?;
+        // let deploy_command = TxCommand {
+        //     command_type: TxType::DeployContract,
+        //     modifier: IncorrectnessModifier::None,
+        //     to: Address::zero(),
+        //     amount: U256::zero(),
+        // };
+        
+        // self.execute_command(deploy_command.clone()).await?;
         self.wait_for_all_inflight_tx().await?;
 
         let mut timer = tokio::time::interval(self.polling_interval);
-        let mut l1_tx_count = 0;
+        // let mut l1_tx_count = 0;
+        // let mut l2_tx_count = 0;
         loop {
             let command = self.generate_command();
-            let is_l1_transaction =
-                matches!(command.command_type, TxType::L1Execute | TxType::Deposit);
-            if is_l1_transaction && l1_tx_count >= MAX_L1_TRANSACTIONS {
-                continue; // Skip command to not run out of Ethereum on L1
+            // let is_l1_transaction =
+            //     matches!(command.command_type, TxType::L1Execute | TxType::Deposit);
+            // if is_l1_transaction && l1_tx_count >= MAX_L1_TRANSACTIONS {
+            //     continue; // Skip command to not run out of Ethereum on L1
+            // }
+            
+            let is_l2_transaction =
+                matches!(command.command_type, TxType::L2Execute);
+
+            if !is_l2_transaction {
+                continue;
             }
 
             // The new transaction should be sent only if mempool is not full
@@ -154,7 +164,8 @@ impl AccountLifespan {
                     self.check_inflight_txs().await?;
                 } else {
                     self.execute_command(command).await?;
-                    l1_tx_count += u64::from(is_l1_transaction);
+                    // l1_tx_count += u64::from(is_l1_transaction);
+                    // l2_tx_count += u64::from(is_l2_transaction);
                     break;
                 }
             }

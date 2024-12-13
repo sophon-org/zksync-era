@@ -133,6 +133,11 @@ where
         WithdrawBuilder::new(self)
     }
 
+    /// Initializes `MintERC20` transaction sending.
+    pub fn start_mint_erc20(&self) -> MintERC20Builder<'_, S, P> {
+        MintERC20Builder::new(self)
+    }
+
     /// Initializes `DeployContract` transaction sending.
     pub fn start_deploy_contract(&self) -> DeployContractBuilder<'_, S, P> {
         DeployContractBuilder::new(self)

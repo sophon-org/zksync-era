@@ -21,13 +21,17 @@ use crate::{
     sdk::{
         ethereum::{PriorityOpHolder, DEFAULT_PRIORITY_FEE},
         utils::{
-            get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
+            get_general_paymaster_input
         },
         web3::TransactionReceipt,
         EthNamespaceClient, EthereumProvider, ZksNamespaceClient,
     },
     utils::format_eth,
 };
+
+use std::collections::HashMap;
+use std::fs;
+use std::str::FromStr;
 
 /// Executor is the entity capable of running the loadtest flow.
 ///
@@ -55,15 +59,20 @@ impl Executor {
     ) -> anyhow::Result<Self> {
         let pool = AccountPool::new(&config).await?;
 
-        // derive L2 main token address
-        let l2_main_token = pool
-            .master_wallet
-            .ethereum(&config.l1_rpc_address)
-            .await
-            .expect("Can't get Ethereum client")
-            .l2_token_address(config.main_token, None)
-            .await
-            .unwrap();
+        // If `l2_main_token` is provided, use it. Otherwise, derive it dynamically.
+        let l2_main_token = if let Some(token) = config.l2_main_token {
+            tracing::info!("Using L2 main token from environment: {:?}", token);
+            token
+        } else {
+            tracing::info!("L2 main token not provided. Deriving dynamically...");
+            pool.master_wallet
+                .ethereum(&config.l1_rpc_address)
+                .await
+                .expect("Can't get Ethereum client")
+                .l2_token_address(config.main_token, None)
+                .await
+                .unwrap()
+        };
 
         Ok(Self {
             config,
@@ -75,6 +84,12 @@ impl Executor {
 
     /// Runs the loadtest until the completion.
     pub async fn start(&mut self) -> LoadtestResult {
+        // Log whether L1 operations will be skipped
+        tracing::info!(
+            "Starting loadtest. Skipping L1 operations: {}",
+            self.config.skip_l1_operations
+        );
+
         // If the error occurs during the main flow, we will consider it as a test failure.
         self.start_inner().await.unwrap_or_else(|err| {
             tracing::error!("Loadtest was interrupted by the following error: {err}");
@@ -86,13 +101,40 @@ impl Executor {
     async fn start_inner(&mut self) -> anyhow::Result<LoadtestResult> {
         tracing::info!("Initializing accounts");
         tracing::info!("Running for MASTER {:?}", self.pool.master_wallet.address());
-        self.check_onchain_balance().await?;
-        self.mint().await?;
-        self.deposit_to_master().await?;
+    
+        if !self.config.skip_l1_operations {
+            tracing::info!("Performing L1 operations.");
+            self.check_onchain_balance().await?;
+            self.mint().await?;
+            self.deposit_to_master().await?;
+            self.deposit_eth_to_paymaster().await?;
+        } else {            
+            if let Some(token) = self.config.l2_main_token {
+                if !token.is_zero() {
+                    tracing::info!("L2 main token is valid. Proceeding with minting.");
+                    // l2_main_token should be used to test ERC20 txs, that logic should be defined
+                    self.mint_l2().await?;
+                } else {
+                    tracing::info!("L2 main token address is zero (invalid). Skipping minting.");
+                }
+            }
 
-        self.deposit_eth_to_paymaster().await?;
+            // Log the Loadnext contract address
+            if let Some(contract) = self.config.loadnext_contract {
+                tracing::info!("Using Loadnext contract address from environment: {:?}", contract);
+            } else {
+                // tracing::warn!("Loadnext contract address not provided in environment");
+                panic!("Loadnext contract address not provided in environment");
+            }
+        }
 
-        let final_result = self.send_initial_transfers().await?;
+        let final_result;
+        if !self.config.skip_l1_operations {
+            final_result = self.send_initial_transfers().await?;
+        } else {
+            final_result = self.send_l2_transfers().await?;
+        }
+    
         Ok(final_result)
     }
 
@@ -178,6 +220,82 @@ impl Executor {
         tracing::info!("Master Account: Minting is OK (balance: {erc20_balance})");
         Ok(())
     }
+
+    async fn mint_l2(&mut self) -> anyhow::Result<()> {
+        tracing::info!("Master Account: Minting 300 unit of ERC20 token on L2...");
+        
+        let master_wallet = &self.pool.master_wallet;
+        let token = self.l2_main_token;
+        
+        // Fetch the current L2 balance
+        let l2_balance = master_wallet
+            .get_balance(BlockNumber::Latest, token)
+            .await?;
+        
+        // Set mint amount to 1 unit (1 wei)
+        let mint_amount = U256::from(300u128);
+        
+        // Check if minting is necessary
+        if l2_balance >= mint_amount + 1 {
+            tracing::info!("L2 balance already sufficient for minting. Current balance: {:?}", l2_balance);
+            return Ok(());
+        }
+    
+        tracing::info!(
+            "Current L2 balance: {:?}, minting amount: {:?}",
+            l2_balance,
+            mint_amount
+        );
+        
+        let paymaster_address = if let Some(address) = self.config.paymaster_address {
+            address
+        } else {
+            self.pool
+                .master_wallet
+                .provider
+                .get_testnet_paymaster()
+                .await?
+                .expect("No testnet paymaster is set")
+        };
+    
+        // Prepare the minting call (using transfer-like logic)
+        let mut builder = master_wallet
+            .start_mint_erc20()
+            .to(master_wallet.address()) // Mint to the same wallet
+            .amount(mint_amount)
+            .token(token);
+    
+        // Set paymaster parameters (using the general flow as an example)
+        let paymaster_params = get_general_paymaster_input(paymaster_address);
+        builder = builder.paymaster_params(paymaster_params);
+    
+        tracing::info!("Prepared transaction with paymaster parameters. Sending...");
+        
+        // Send the transaction
+        let mut handle = builder.send().await?;
+        tracing::info!("Mint transaction sent, awaiting confirmation...");
+    
+        // Wait for the transaction to commit
+        handle.polling_interval(POLLING_INTERVAL.end)?;
+        let result = handle.commit_timeout(COMMIT_TIMEOUT).wait_for_commit().await?;
+    
+        // Check transaction result
+        if result.status == U64::zero() {
+            anyhow::bail!("Minting transaction failed on L2");
+        }
+    
+        // Fetch the updated L2 balance
+        let updated_l2_balance = master_wallet
+            .get_balance(BlockNumber::Latest, token)
+            .await?;
+        
+        tracing::info!(
+            "Minting successful. Updated L2 balance: {:?}",
+            updated_l2_balance
+        );
+    
+        Ok(())
+    }    
 
     /// Deposits the ERC-20 token to main wallet in L2.
     async fn deposit_to_master(&mut self) -> anyhow::Result<()> {
@@ -265,13 +383,16 @@ impl Executor {
         ethereum.set_confirmation_timeout(ETH_CONFIRMATION_TIMEOUT);
         ethereum.set_polling_interval(ETH_POLLING_INTERVAL);
 
-        let paymaster_address = self
-            .pool
-            .master_wallet
-            .provider
-            .get_testnet_paymaster()
-            .await?
-            .expect("No testnet paymaster is set");
+        let paymaster_address = if let Some(address) = self.config.paymaster_address {
+            address
+        } else {
+            self.pool
+                .master_wallet
+                .provider
+                .get_testnet_paymaster()
+                .await?
+                .expect("No testnet paymaster is set")
+        };
 
         let paymaster_balance: U256 = self
             .pool
@@ -346,13 +467,16 @@ impl Executor {
         let weight_of_l1_txs = self.execution_config.transaction_weights.l1_transactions
             + self.execution_config.transaction_weights.deposit;
 
-        let paymaster_address = self
-            .pool
-            .master_wallet
-            .provider
-            .get_testnet_paymaster()
-            .await?
-            .expect("No testnet paymaster is set");
+        let paymaster_address = if let Some(address) = self.config.paymaster_address {
+            address
+        } else {
+            self.pool
+                .master_wallet
+                .provider
+                .get_testnet_paymaster()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Paymaster address not set on testnet"))?
+        };
 
         let mut ethereum = master_wallet
             .ethereum(&self.config.l1_rpc_address)
@@ -431,30 +555,19 @@ impl Executor {
             // And then we will prepare an L2 transaction to send ERC20 token (for transfers and fees).
             let mut builder = master_wallet
                 .start_transfer()
-                .to(target_address)
+                .to(target_address) // Mint to the same wallet
                 .amount(l2_transfer_amount.into())
                 .token(self.l2_main_token)
                 .nonce(nonce);
 
-            let paymaster_params = get_approval_based_paymaster_input_for_estimation(
-                paymaster_address,
-                self.l2_main_token,
-                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
-            );
-
-            let fee = builder.estimate_fee(Some(paymaster_params)).await?;
-            builder = builder.fee(fee.clone());
-
-            let paymaster_params = get_approval_based_paymaster_input(
-                paymaster_address,
-                self.l2_main_token,
-                fee.max_total_fee(),
-                Vec::new(),
-            );
-            builder = builder.fee(fee);
+            // Set paymaster parameters (using the general flow as an example)
+            let paymaster_params = get_general_paymaster_input(paymaster_address);
             builder = builder.paymaster_params(paymaster_params);
-
+        
+            // Send the transaction
+            tracing::info!("Prepared transaction with paymaster parameters. Sending...");
             let handle_erc20 = builder.send().await?;
+            tracing::info!("Mint transaction sent, awaiting confirmation...");
             handles.push(handle_erc20);
 
             *nonce += 1;
@@ -518,13 +631,17 @@ impl Executor {
         let config = &self.config;
         let accounts_amount = config.accounts_amount;
         let addresses = self.pool.addresses.clone();
-        let paymaster_address = self
-            .pool
-            .master_wallet
-            .provider
-            .get_testnet_paymaster()
-            .await?
-            .expect("No testnet paymaster is set");
+        let paymaster_address = if let Some(address) = self.config.paymaster_address {
+            println!("Paymaster address: {}", hex::encode(address));
+            address
+        } else {
+            self.pool
+                .master_wallet
+                .provider
+                .get_testnet_paymaster()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Paymaster address not set on testnet"))?
+        };
 
         let mut retry_counter = 0;
         let mut accounts_processed = 0;
@@ -600,6 +717,112 @@ impl Executor {
         Ok(report_collector_future.await?)
     }
 
+    async fn send_l2_transfers(&mut self) -> anyhow::Result<LoadtestResult> {
+        tracing::info!("Master Account: Sending initial L2 transfers");
+        // How many times we will resend a batch.
+        const MAX_RETRIES: usize = 4;
+
+        // Prepare channels for the report collector.
+        let (mut report_sender, report_receiver) = mpsc::channel(256);
+
+        let report_collector = ReportCollector::new(
+            report_receiver,
+            self.config.expected_tx_count,
+            self.config.duration(),
+            self.config.prometheus_label.clone(),
+            self.config.fail_fast,
+        );
+        let report_collector_future = tokio::spawn(report_collector.run());
+
+        let config = &self.config;
+        let accounts_amount = config.accounts_amount;
+        let addresses = self.pool.addresses.clone();
+        let paymaster_address = if let Some(address) = self.config.paymaster_address {
+            // println!("Paymaster address: {}", hex::encode(address));
+            address
+        } else {
+            self.pool
+                .master_wallet
+                .provider
+                .get_testnet_paymaster()
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Paymaster address not set on testnet"))?
+        };
+
+        let mut retry_counter = 0;
+        let mut accounts_processed = 0;
+        let limiters = Arc::new(RequestLimiters::new(config));
+
+        let mut account_tasks = vec![];
+        while accounts_processed != accounts_amount {
+            if retry_counter > MAX_RETRIES {
+                anyhow::bail!("Reached max amount of retries when sending initial transfers");
+            }
+
+            let accounts_left = accounts_amount - accounts_processed;
+            let max_accounts_per_iter = MAX_OUTSTANDING_NONCE;
+            let accounts_to_process = std::cmp::min(accounts_left, max_accounts_per_iter);
+
+            accounts_processed += accounts_to_process;
+            tracing::info!("[{accounts_processed}/{accounts_amount}] Accounts processed");
+
+            retry_counter = 0;
+
+            let contract_execution_params = self.execution_config.contract_execution_params.clone();
+            // Spawn each account lifespan.
+            let main_token = self.l2_main_token;
+
+            anyhow::ensure!(
+                !report_sender.is_closed(),
+                "test aborted; see reporter logs for details"
+            );
+
+            let new_account_futures =
+                self.pool
+                    .accounts
+                    .drain(..accounts_to_process)
+                    .map(|wallet| {
+                        let account = AccountLifespan::new(
+                            config,
+                            contract_execution_params.clone(),
+                            addresses.clone(),
+                            wallet,
+                            report_sender.clone(),
+                            main_token,
+                            paymaster_address,
+                        );
+                        let limiters = Arc::clone(&limiters);
+                        tokio::spawn(async move { account.run(&limiters).await })
+                    });
+            account_tasks.extend(new_account_futures);
+        }
+
+        report_sender
+            .send(ReportBuilder::build_init_complete_report())
+            .await
+            .map_err(|_| anyhow!("test aborted; see reporter logs for details"))?;
+        drop(report_sender);
+        // ^ to terminate `report_collector_future` once all `account_futures` are finished
+
+        assert!(
+            self.pool.accounts.is_empty(),
+            "Some accounts were not drained"
+        );
+        tracing::info!("All the initial transfers are completed");
+
+        // Print the tasks before awaiting their completion
+        tracing::info!("Tasks to be processed:");
+        for (index, task) in account_tasks.iter().enumerate() {
+            tracing::info!("Task {}: {:?}", index + 1, task);
+        }
+
+        tracing::info!("Waiting for the account futures to be completed...");
+        future::try_join_all(account_tasks).await?;
+        tracing::info!("All the spawned tasks are completed");
+
+        Ok(report_collector_future.await?)
+    }
+
     /// Calculates amount of ETH to be distributed per account in order to make them
     /// able to perform priority operations.
     async fn eth_amount_to_distribute(&self) -> anyhow::Result<U256> {
@@ -660,6 +883,23 @@ impl Executor {
                 "Ethereum transaction unexpectedly failed.\nReceipt: {:#?}\nFailure reason: {:#?}",
                 receipt, failure_reason
             );
+        }
+    }
+
+    pub fn get_contract_address(&self, json_path: &str) -> Option<Address> {
+        // Load and parse the JSON file
+        let file_content = fs::read_to_string(json_path).expect("Failed to read the JSON file");
+        let addresses: HashMap<String, String> =
+            serde_json::from_str(&file_content).expect("Failed to parse JSON");
+
+        // Get the `reads` value from `contract_execution_params`
+        let reads = self.execution_config.contract_execution_params.reads.to_string();
+
+        // Find the corresponding address
+        if let Some(ca_str) = addresses.get(&reads) {
+            Address::from_str(ca_str).ok()
+        } else {
+            None
         }
     }
 }

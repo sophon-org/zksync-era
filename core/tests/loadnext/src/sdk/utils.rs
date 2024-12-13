@@ -5,6 +5,7 @@ use zksync_types::{transaction_request::PaymasterParams, Address, U256};
 use crate::sdk::ethabi::{Contract, Token};
 
 const IPAYMASTER_FLOW_INTERFACE: &str = include_str!("./abi/IPaymasterFlow.json");
+// const SOPHON_PAYMASTER: &str = include_str!("./abi/SophonPaymaster.json");
 
 pub fn is_token_eth(token_address: Address) -> bool {
     token_address == Address::zero()
@@ -54,4 +55,23 @@ pub fn get_approval_based_paymaster_input_for_estimation(
     min_allowance: U256,
 ) -> PaymasterParams {
     get_approval_based_paymaster_input(paymaster, token_address, min_allowance, Default::default())
+}
+
+pub fn get_general_paymaster_input(paymaster: Address) -> PaymasterParams {
+    // Load the paymaster flow interface
+    let paymaster_contract = load_contract(IPAYMASTER_FLOW_INTERFACE);
+    
+    // Encode the call to the `general` function with empty input
+    let data = b"0x".to_vec(); // Matches bytes("0x") in Solidity
+    let paymaster_input = paymaster_contract
+        .function("general")
+        .unwrap()
+        .encode_input(&[Token::Bytes(data)]) // Encode with "0x"
+        .unwrap();
+
+    // Return the PaymasterParams
+    PaymasterParams {
+        paymaster,
+        paymaster_input,
+    }
 }

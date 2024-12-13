@@ -114,6 +114,18 @@ pub struct LoadtestConfig {
     /// in an eventual test failure anyway (e.g., a failure processing transactions).
     #[serde(default)]
     pub fail_fast: bool,
+
+    #[serde(default = "default_paymaster_address")]
+    pub paymaster_address: Option<Address>,
+
+    #[serde(default = "default_skip_l1_operations")]
+    pub skip_l1_operations: bool,
+
+    #[serde(default = "default_l2_main_token")]
+    pub l2_main_token: Option<Address>,
+
+    #[serde(default = "default_loadnext_contract")]
+    pub loadnext_contract: Option<Address>,
 }
 
 fn default_max_inflight_txs() -> usize {
@@ -225,6 +237,22 @@ fn default_prometheus_label() -> String {
     let result = "unset".to_string();
     tracing::info!("Using default PROMETHEUS_LABEL: {result:?}");
     result
+}
+
+fn default_paymaster_address() -> Option<Address> {
+    None
+}
+
+fn default_skip_l1_operations() -> bool {
+    true
+}
+
+fn default_l2_main_token() -> Option<Address> {
+    Some(Address::zero())
+}
+
+fn default_loadnext_contract() -> Option<Address> {
+    None
 }
 
 impl LoadtestConfig {

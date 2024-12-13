@@ -20,11 +20,10 @@ use crate::{
         ethabi,
         ethereum::PriorityOpHolder,
         utils::{
-            get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation,
+            get_approval_based_paymaster_input, get_approval_based_paymaster_input_for_estimation, get_general_paymaster_input,
         },
         EthNamespaceClient,
-    },
-    utils::format_gwei,
+    }
 };
 
 #[derive(Debug)]
@@ -309,11 +308,14 @@ impl AccountLifespan {
     ) -> Result<SubmitResult, ClientError> {
         const L1_TRANSACTION_GAS_LIMIT: u32 = 5_000_000;
 
-        let Some(&contract_address) = self.wallet.deployed_contract_address.get() else {
-            let label =
-                ReportLabel::skipped("Account haven't successfully deployed a contract yet");
-            return Ok(SubmitResult::ReportLabel(label));
-        };
+        // TODO: update 
+        // given the amount of reads to execute use a different contract instead of deploying it at start
+        // we could use a mapping of the amount of reads to the contract address
+        // Ensure contract address is provided
+        let contract_address = self
+            .config
+            .loadnext_contract
+            .expect("LOADNEXT_CONTRACT address must be provided in the environment");
 
         match execution_type {
             ExecutionType::L1 => {
@@ -404,31 +406,8 @@ impl AccountLifespan {
             .contract_address(contract_address)
             .factory_deps(self.wallet.test_contract.factory_deps());
 
-        let fee = builder
-            .estimate_fee(Some(get_approval_based_paymaster_input_for_estimation(
-                self.paymaster_address,
-                self.main_l2_token,
-                MIN_ALLOWANCE_FOR_PAYMASTER_ESTIMATE.into(),
-            )))
-            .await?;
-        tracing::trace!(
-            "Account {:?}: fee estimated. Max total fee: {}, gas limit: {}gas; Max gas price: {}WEI, \
-             Gas per pubdata: {:?}gas",
-            self.wallet.wallet.address(),
-            format_gwei(fee.max_total_fee()),
-            fee.gas_limit,
-            fee.max_fee_per_gas,
-            fee.gas_per_pubdata_limit
-        );
-        builder = builder.fee(fee.clone());
-
-        let paymaster_params = get_approval_based_paymaster_input(
-            self.paymaster_address,
-            self.main_l2_token,
-            fee.max_total_fee(),
-            Vec::new(),
-        );
-        builder = builder.fee(fee);
+        // Should implement the fee method on the builder to estimate
+        let paymaster_params = get_general_paymaster_input(self.paymaster_address);
         builder = builder.paymaster_params(paymaster_params);
 
         if let Some(nonce) = self.current_nonce {

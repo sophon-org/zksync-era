@@ -123,3 +123,6 @@ transactions/
 
 # foundry-zksync
 install
+
+# loadnext
+core/tests/loadnext/.env
