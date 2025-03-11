@@ -21,7 +21,7 @@ pub struct ServerArgs {
 #[derive(Debug, Subcommand)]
 pub enum ServerCommand {
     /// Builds server
-    Build,
+    Build(BuildServerArgs),
     /// Runs server
     Run(RunServerArgs),
     /// Waits for server to start
@@ -48,6 +48,12 @@ pub struct RunServerArgs {
         help = MSG_SERVER_ADDITIONAL_ARGS_HELP
     )]
     additional_args: Vec<String>,
+    #[clap(help = MSG_SERVER_URING_HELP, long, default_missing_value = "true")]
+    pub uring: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Parser)]
+pub struct BuildServerArgs {
     #[clap(help = MSG_SERVER_URING_HELP, long, default_missing_value = "true")]
     pub uring: bool,
 }
