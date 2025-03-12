@@ -136,6 +136,7 @@ _arguments "${_arguments_options[@]}" : \
 '--update-submodules=[]:UPDATE_SUBMODULES:(true false)' \
 '--validium-type=[Type of the Validium network]:VALIDIUM_TYPE:(no-da avail eigen-da)' \
 '--support-l2-legacy-shared-bridge-test=[]' \
+'--skip-contract-compilation-override=[]' \
 '--chain=[Chain to use]:CHAIN:_default' \
 '--resume[]' \
 '--zksync[]' \
@@ -144,7 +145,6 @@ _arguments "${_arguments_options[@]}" : \
 '--ecosystem-only[Initialize ecosystem only and skip chain initialization (chain can be initialized later with \`chain init\` subcommand)]' \
 '--dev[Use defaults for all options and flags. Suitable for local development]' \
 '--no-port-reallocation[Do not reallocate ports]' \
-'--skip-contract-compilation-override[]' \
 '-v[Verbose mode]' \
 '--verbose[Verbose mode]' \
 '--ignore-prerequisites[Ignores prerequisites checks]' \
@@ -1896,6 +1896,13 @@ _arguments "${_arguments_options[@]}" : \
 '--bucket-name=[]:BUCKET_NAME:_default' \
 '--location=[]:LOCATION:_default' \
 '--project-id=[]:PROJECT_ID:_default' \
+'--shall-save-to-public-bucket=[]:SHALL_SAVE_TO_PUBLIC_BUCKET:(true false)' \
+'--public-store-dir=[]:PUBLIC_STORE_DIR:_default' \
+'--public-bucket-base-url=[]:PUBLIC_BUCKET_BASE_URL:_default' \
+'--public-credentials-file=[]:PUBLIC_CREDENTIALS_FILE:_default' \
+'--public-bucket-name=[]:PUBLIC_BUCKET_NAME:_default' \
+'--public-location=[]:PUBLIC_LOCATION:_default' \
+'--public-project-id=[]:PUBLIC_PROJECT_ID:_default' \
 '(--clone)--bellman-cuda-dir=[]:BELLMAN_CUDA_DIR:_default' \
 '--bellman-cuda=[]' \
 '--setup-compressor-key=[]' \
@@ -2049,6 +2056,7 @@ _arguments "${_arguments_options[@]}" : \
             (build)
 _arguments "${_arguments_options[@]}" : \
 '--chain=[Chain to use]:CHAIN:_default' \
+'--uring[Enables uring support for RocksDB]' \
 '-v[Verbose mode]' \
 '--verbose[Verbose mode]' \
 '--ignore-prerequisites[Ignores prerequisites checks]' \
